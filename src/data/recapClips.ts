@@ -25,7 +25,7 @@ export interface RenderResult {
 }
 
 export const SOURCE_VIDEO_URL =
-  '/assets/aistudio/___________________________________________part9_c40396cb.mp4';
+  '/assets/aistudio/part9.mp4';
 
 export const INITIAL_RECAP_CLIPS: RecapClip[] = [
   {

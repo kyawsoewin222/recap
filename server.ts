@@ -22,7 +22,7 @@ const SOURCE_VIDEO_PATH = path.join(
   PUBLIC_DIR,
   'assets',
   'aistudio',
-  '___________________________________________part9_c40396cb.mp4'
+  'part9.mp4'
 );
 
 fs.mkdirSync(TTS_DIR, { recursive: true });
@@ -249,8 +249,8 @@ async function startServer() {
   });
 
   app.get('/api/default-render', async (_req, res) => {
-    const mp4Path = path.join(RENDERS_DIR, 'burmese-recap-part9-16x9-split.mp4');
-    const srtPath = path.join(RENDERS_DIR, 'burmese-recap-part9-16x9-split.srt');
+    const mp4Path = path.join(RENDERS_DIR, 'part9.mp4');
+    const srtPath = path.join(RENDERS_DIR, 'part9.srt');
     if (!fs.existsSync(mp4Path)) {
       res.json(null);
       return;
@@ -259,9 +259,9 @@ async function startServer() {
       const durationSec = await probeDuration(mp4Path);
       const stats = fs.statSync(mp4Path);
       res.json({
-        videoUrl: '/renders/burmese-recap-part9-16x9-split.mp4',
+        videoUrl: '/renders/part9.mp4',
         srtUrl: fs.existsSync(srtPath)
-          ? '/renders/burmese-recap-part9-16x9-split.srt'
+          ? '/renders/part9.srt'
           : '',
         durationSec,
         fileSizeBytes: stats.size,
@@ -774,11 +774,14 @@ Rules:
         mergedRawPath,
       ]);
 
-      const stamp = Date.now();
-      const finalMp4Name = `burmese-recap-16x9-${stamp}.mp4`;
-      const finalSrtName = `burmese-recap-16x9-${stamp}.srt`;
+      const episode = path.basename(sourcePath).match(/(?:part|episode|ep)[_ -]*(\d+)/i)?.[1];
+      const name = episode ? `part${episode}` : `burmese-recap-16x9-${Date.now()}`;
+      const finalMp4Name = `${name}.mp4`;
+      const finalSrtName = `${name}.srt`;
       const finalMp4Path = path.join(RENDERS_DIR, finalMp4Name);
       const finalSrtPath = path.join(RENDERS_DIR, finalSrtName);
+      const tempMp4Path = path.join(tempDir, finalMp4Name);
+      const tempSrtPath = path.join(tempDir, finalSrtName);
 
       // Write SRT for external YouTube upload
       const srtContent = subtitleTimings
@@ -787,7 +790,7 @@ Rules:
             `${idx + 1}\n${formatSrtTime(item.start)} --> ${formatSrtTime(item.end)}\n${item.burmese}\n`
         )
         .join('\n');
-      fs.writeFileSync(finalSrtPath, srtContent, 'utf8');
+      fs.writeFileSync(tempSrtPath, srtContent, 'utf8');
 
       if (includeSubtitles) {
         const assPath = path.join(tempDir, 'subtitles.ass');
@@ -834,7 +837,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             'copy',
             '-movflags',
             '+faststart',
-            finalMp4Path,
+            tempMp4Path,
           ],
           { cwd: tempDir }
         );
@@ -847,10 +850,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
           'copy',
           '-movflags',
           '+faststart',
-          finalMp4Path,
+          tempMp4Path,
         ]);
       }
 
+      fs.renameSync(tempMp4Path, finalMp4Path);
+      fs.renameSync(tempSrtPath, finalSrtPath);
       const stats = fs.statSync(finalMp4Path);
       const totalDuration = await probeDuration(finalMp4Path);
 

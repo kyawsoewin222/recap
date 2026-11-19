@@ -1,3 +1,4 @@
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -190,15 +191,18 @@ def render_16x9_recap(
         check=True,
     )
 
-    stamp = int(time.time() * 1000)
-    final_mp4 = RENDERS_DIR / f"burmese-recap-16x9-{stamp}.mp4"
-    final_srt = RENDERS_DIR / f"burmese-recap-16x9-{stamp}.srt"
+    episode = re.search(r"(?:part|episode|ep)[_ -]*(\d+)", src_path.stem, re.IGNORECASE)
+    name = f"part{episode.group(1)}" if episode else f"burmese-recap-16x9-{int(time.time() * 1000)}"
+    final_mp4 = RENDERS_DIR / f"{name}.mp4"
+    final_srt = RENDERS_DIR / f"{name}.srt"
+    temp_mp4 = work_dir / f"{name}.mp4"
+    temp_srt = work_dir / f"{name}.srt"
 
     srt_lines = [
         f"{i + 1}\n{format_srt_time(start)} --> {format_srt_time(end)}\n{text}\n"
         for i, (start, end, text) in enumerate(subtitle_timings)
     ]
-    final_srt.write_text("\n".join(srt_lines), encoding="utf-8")
+    temp_srt.write_text("\n".join(srt_lines), encoding="utf-8")
 
     if include_subtitles:
         ass_header = """[Script Info]
@@ -234,7 +238,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "-pix_fmt", "yuv420p",
                 "-c:a", "copy",
                 "-movflags", "+faststart",
-                str(final_mp4.resolve()),
+                str(temp_mp4.resolve()),
             ],
             cwd=str(work_dir),
             check=True,
@@ -246,10 +250,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "-i", str(merged_raw),
                 "-c", "copy",
                 "-movflags", "+faststart",
-                str(final_mp4),
+                str(temp_mp4),
             ],
             check=True,
         )
+
+    temp_mp4.replace(final_mp4)
+    temp_srt.replace(final_srt)
 
     return {
         "job_id": resolved_job_id,
