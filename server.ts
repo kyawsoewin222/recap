@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import dotenv from 'dotenv';
 import express from 'express';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
 import { createServer as createViteServer } from 'vite';
@@ -17,6 +18,7 @@ const ROOT_DIR = process.cwd();
 const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
 const TTS_DIR = path.join(PUBLIC_DIR, 'tts');
 const RENDERS_DIR = path.join(PUBLIC_DIR, 'renders');
+const AISTUDIO_DIR = path.join(PUBLIC_DIR, 'assets', 'aistudio');
 const UPLOADS_DIR = path.join(PUBLIC_DIR, 'uploads');
 const SOURCE_VIDEO_PATH = path.join(
   PUBLIC_DIR,
@@ -27,6 +29,7 @@ const SOURCE_VIDEO_PATH = path.join(
 
 fs.mkdirSync(TTS_DIR, { recursive: true });
 fs.mkdirSync(RENDERS_DIR, { recursive: true });
+fs.mkdirSync(AISTUDIO_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 function getAiClient(): GoogleGenAI {
@@ -93,7 +96,7 @@ async function probeVideoInfo(filePath: string): Promise<{
 
 function resolveSourceVideoPath(sourceVideoUrl?: string): string {
   if (!sourceVideoUrl) return SOURCE_VIDEO_PATH;
-  const cleanRel = sourceVideoUrl.split('?')[0].replace(/^\/+/, '');
+  const cleanRel = decodeURIComponent(sourceVideoUrl.split('?')[0]).replace(/^\/+/, '');
   if (!cleanRel.startsWith('assets/') && !cleanRel.startsWith('uploads/')) {
     throw new Error('Invalid source video URL.');
   }
@@ -102,6 +105,11 @@ function resolveSourceVideoPath(sourceVideoUrl?: string): string {
     throw new Error('Invalid source video path.');
   }
   return resolved;
+}
+
+function projectNameFromSource(sourcePath: string): string | null {
+  const relative = path.relative(AISTUDIO_DIR, path.dirname(sourcePath));
+  return relative && relative !== '..' && !relative.includes(path.sep) ? relative : null;
 }
 
 async function withGeminiRetry<T>(fn: () => Promise<T>, maxRetries = 4): Promise<T> {
@@ -175,15 +183,43 @@ async function startServer() {
         return rawName;
       }
     })();
-    const ext = path.extname(decodedName).toLowerCase() || '.mp4';
+    const fileName = path.basename(decodedName.replace(/\\/g, '/'));
+    const ext = path.extname(fileName).toLowerCase() || '.mp4';
     const allowedExt = ['.mp4', '.mov', '.mkv', '.webm', '.m4v'];
     const safeExt = allowedExt.includes(ext) ? ext : '.mp4';
-    const baseName = path
-      .basename(decodedName, ext)
-      .replace(/[^a-zA-Z0-9_-]+/g, '_')
-      .slice(0, 48) || 'episode';
+    const stem = path.basename(fileName, path.extname(fileName)).normalize('NFC');
+    const projectBase = Array.from(stem).slice(0, 10).join('')
+      .replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_')
+      .replace(/[. ]+$/g, '') || 'episode';
+    let projectName = projectBase;
+    let projectDir = path.join(AISTUDIO_DIR, projectName);
+    for (let suffix = 2; ; suffix++) {
+      if (fs.existsSync(path.join(RENDERS_DIR, projectName))) {
+        projectName = `${projectBase}-${suffix}`;
+        projectDir = path.join(AISTUDIO_DIR, projectName);
+        continue;
+      }
+      try {
+        fs.mkdirSync(projectDir);
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        projectName = `${projectBase}-${suffix}`;
+        projectDir = path.join(AISTUDIO_DIR, projectName);
+      }
+    }
+    fs.mkdirSync(path.join(RENDERS_DIR, projectName));
+    const baseName = Array.from(stem
+      .replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_')
+      .replace(/[. ]+$/g, '')).slice(0, 48).join('') || 'episode';
     const savedName = `${baseName}-${Date.now()}${safeExt}`;
-    const destPath = path.join(UPLOADS_DIR, savedName);
+    const destPath = path.join(projectDir, savedName);
+    const cleanupUpload = () => {
+      fs.rmSync(destPath, { force: true });
+      for (const dir of [projectDir, path.join(RENDERS_DIR, projectName)]) {
+        try { fs.rmdirSync(dir); } catch { /* Keep nonempty folders. */ }
+      }
+    };
 
     const writeStream = fs.createWriteStream(destPath);
     let receivedBytes = 0;
@@ -197,33 +233,34 @@ async function startServer() {
     writeStream.on('finish', async () => {
       try {
         if (receivedBytes < 1024) {
-          fs.rmSync(destPath, { force: true });
+          cleanupUpload();
           res.status(400).json({ error: 'Uploaded video file is empty or invalid.' });
           return;
         }
         const info = await probeVideoInfo(destPath);
         if (info.durationSec <= 0) {
-          fs.rmSync(destPath, { force: true });
+          cleanupUpload();
           res.status(400).json({ error: 'Could not read video duration from uploaded file.' });
           return;
         }
         res.json({
-          sourceVideoUrl: `/uploads/${savedName}`,
-          fileName: decodedName,
+          sourceVideoUrl: `/assets/aistudio/${encodeURIComponent(projectName)}/${encodeURIComponent(savedName)}`,
+          fileName,
+          projectName,
           durationSec: info.durationSec,
           width: info.width,
           height: info.height,
           fileSizeBytes: receivedBytes,
         });
       } catch (err: unknown) {
-        fs.rmSync(destPath, { force: true });
+        cleanupUpload();
         const message = err instanceof Error ? err.message : 'Failed to process uploaded video.';
         res.status(500).json({ error: message });
       }
     });
 
     const handleStreamError = (err: unknown) => {
-      fs.rmSync(destPath, { force: true });
+      cleanupUpload();
       const message = err instanceof Error ? err.message : 'Upload stream failed.';
       if (!res.headersSent) {
         res.status(500).json({ error: message });
@@ -246,6 +283,42 @@ async function startServer() {
       ok: true,
       sourceExists: fs.existsSync(SOURCE_VIDEO_PATH),
     });
+  });
+
+  app.get('/api/projects/:project/download', async (req, res) => {
+    const project = req.params.project;
+    if (!project || project === '.' || project === '..' || path.basename(project) !== project) {
+      res.status(400).json({ error: 'Invalid project name.' });
+      return;
+    }
+    const sourceDir = path.join(AISTUDIO_DIR, project);
+    const renderDir = path.join(RENDERS_DIR, project);
+    if (!fs.existsSync(sourceDir) || !fs.existsSync(renderDir)) {
+      res.status(404).json({ error: 'Project folder was not found.' });
+      return;
+    }
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'recapcut-'));
+    const zipPath = path.join(tempDir, `${project}.zip`);
+    try {
+      await execFileAsync('python3', ['-c', `
+from pathlib import Path
+from zipfile import ZipFile, ZIP_STORED
+import sys
+archive, project, source, renders = sys.argv[1:]
+with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
+    for label, directory in [('aistudio', Path(source)), ('renders', Path(renders))]:
+        for file in directory.rglob('*'):
+            if file.is_file():
+                zip_file.write(file, f'{project}/{label}/{file.relative_to(directory)}')
+`, zipPath, project, sourceDir, renderDir]);
+      res.download(zipPath, `${project}.zip`, () => {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      });
+    } catch (err) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      const message = err instanceof Error ? err.message : 'Could not package project.';
+      res.status(500).json({ error: message });
+    }
   });
 
   app.get('/api/default-render', async (_req, res) => {
@@ -778,8 +851,11 @@ Rules:
       const name = episode ? `part${episode}` : `burmese-recap-16x9-${Date.now()}`;
       const finalMp4Name = `${name}.mp4`;
       const finalSrtName = `${name}.srt`;
-      const finalMp4Path = path.join(RENDERS_DIR, finalMp4Name);
-      const finalSrtPath = path.join(RENDERS_DIR, finalSrtName);
+      const projectName = projectNameFromSource(sourcePath);
+      const outputDir = projectName ? path.join(RENDERS_DIR, projectName) : RENDERS_DIR;
+      fs.mkdirSync(outputDir, { recursive: true });
+      const finalMp4Path = path.join(outputDir, finalMp4Name);
+      const finalSrtPath = path.join(outputDir, finalSrtName);
       const tempMp4Path = path.join(tempDir, finalMp4Name);
       const tempSrtPath = path.join(tempDir, finalSrtName);
 
@@ -860,8 +936,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       const totalDuration = await probeDuration(finalMp4Path);
 
       res.json({
-        videoUrl: `/renders/${finalMp4Name}`,
-        srtUrl: `/renders/${finalSrtName}`,
+        videoUrl: `/renders/${projectName ? `${encodeURIComponent(projectName)}/` : ''}${finalMp4Name}`,
+        srtUrl: `/renders/${projectName ? `${encodeURIComponent(projectName)}/` : ''}${finalSrtName}`,
+        downloadUrl: projectName ? `/api/projects/${encodeURIComponent(projectName)}/download` : undefined,
         durationSec: totalDuration,
         fileSizeBytes: stats.size,
         width: 1280,

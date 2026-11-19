@@ -18,6 +18,7 @@ export interface ClipAudioState {
 export interface RenderResult {
   videoUrl: string;
   srtUrl: string;
+  downloadUrl?: string;
   durationSec: number;
   fileSizeBytes: number;
   width: number;

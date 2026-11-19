@@ -558,6 +558,16 @@ export default function RecapPlayer({
 
           {renderResult && (
             <>
+              {renderResult.downloadUrl && (
+                <a
+                  href={renderResult.downloadUrl}
+                  download
+                  className="h-10 px-3 inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-[#161D2D] hover:bg-slate-800 text-xs font-medium text-slate-200 transition-colors whitespace-nowrap shrink-0"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Download whole folder</span>
+                </a>
+              )}
               <a
                 href={renderResult.srtUrl}
                 download
