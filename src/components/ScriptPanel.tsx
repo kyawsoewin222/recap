@@ -7,7 +7,7 @@ import {
   Play,
   Volume2,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ClipAudioState, RecapClip } from '../data/recapClips';
 
 const VOICE_OPTIONS = [
@@ -27,7 +27,7 @@ interface ScriptPanelProps {
   onSelectClip: (index: number) => void;
   onUpdateClip: (
     clipId: number,
-    patch: Partial<Pick<RecapClip, 'burmeseScript' | 'englishScript'>>
+    patch: Partial<Pick<RecapClip, 'burmeseScript' | 'englishScript' | 'sourceStart' | 'sourceEnd'>>
   ) => void;
   onGenerateClipAudio: (clip: RecapClip) => Promise<void>;
   onGenerateAllAudio: () => Promise<void>;
@@ -67,6 +67,21 @@ export default function ScriptPanel({
 }: ScriptPanelProps) {
   const [copiedBurmese, setCopiedBurmese] = useState(false);
   const [previewPlayingId, setPreviewPlayingId] = useState<number | null>(null);
+  const previewAudio = useRef<{ audio: HTMLAudioElement; clipId: number; url: string } | null>(null);
+
+  useEffect(() => {
+    const preview = previewAudio.current;
+    if (preview && (audioMap[preview.clipId]?.audioUrl !== preview.url || audioMap[preview.clipId]?.status !== 'ready')) {
+      preview.audio.pause();
+      previewAudio.current = null;
+      setPreviewPlayingId(null);
+    }
+  }, [audioMap]);
+
+  useEffect(() => () => {
+    previewAudio.current?.audio.pause();
+    previewAudio.current = null;
+  }, []);
 
   const readyAudioCount = clips.filter(
     (c) => audioMap[c.id]?.status === 'ready'
@@ -85,11 +100,19 @@ export default function ScriptPanel({
   };
 
   const handlePlaySingleAudio = (clipId: number, url: string) => {
+    previewAudio.current?.audio.pause();
     const audio = new Audio(url);
+    previewAudio.current = { audio, clipId, url };
     setPreviewPlayingId(clipId);
-    audio.onended = () => setPreviewPlayingId(null);
-    audio.onerror = () => setPreviewPlayingId(null);
-    audio.play().catch(() => setPreviewPlayingId(null));
+    const finish = () => {
+      if (previewAudio.current?.audio === audio) {
+        previewAudio.current = null;
+        setPreviewPlayingId(null);
+      }
+    };
+    audio.onended = finish;
+    audio.onerror = finish;
+    audio.play().catch(finish);
   };
 
   return (
@@ -250,6 +273,20 @@ export default function ScriptPanel({
                 </div>
               </div>
 
+              <div className="flex gap-3 text-xs text-slate-400" onClick={(event) => event.stopPropagation()}>
+                {(['sourceStart', 'sourceEnd'] as const).map((field) => (
+                  <label key={`${clip.id}-${field}-${clip[field]}`} className="flex items-center gap-2">
+                    {field === 'sourceStart' ? 'Source start (s)' : 'Source end (s)'}
+                    <input type="number" min={0} step={0.1} defaultValue={clip[field]} disabled={busy}
+                      className="w-20 rounded bg-slate-900 p-1 text-slate-100" aria-label={`${field} for ${clip.title}`}
+                      onBlur={(event) => {
+                        if (event.target.value !== '' && Number(event.target.value) !== clip[field]) {
+                          onUpdateClip(clip.id, { [field]: Number(event.target.value) });
+                        }
+                      }} />
+                  </label>
+                ))}
+              </div>
               {/* Editable Burmese narration */}
               <div onClick={(e) => e.stopPropagation()}>
                 <textarea

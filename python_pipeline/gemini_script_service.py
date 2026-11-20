@@ -211,7 +211,10 @@ Previous story context:
 Rules:
 - Break this segment into fast-paced sequential clips covering key plot & action beats.
 - Use absolute movie timestamps in seconds (`source_start`, `source_end`) within [{start}, {end}].
-- Each narration paragraph must be short enough to speak in 8-10 seconds (~20-26 words).
+- Prefer concise natural Burmese narration; short durations are preferences, never hard caps.
+- Remove repetition only. Preserve identities, actions, motivations, cause/effect, outcomes, dialogue meaning, reveals, and chronology; invent no facts.
+- Compare narration against the source context and English script before returning it. Use longer relevant scene ranges when essential meaning needs longer narration.
+- Choose complete relevant action spans in chronological order; never borrow unrelated scenes.
 - Do NOT copy or translate movie dialogue verbatim; summarize in completely original wording.
 - Return `english_script` and natural, engaging spoken Burmese in `burmese_script`.
 - Also return a 2-3 sentence `chunk_summary` to pass continuity to the next segment.

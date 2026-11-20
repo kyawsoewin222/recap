@@ -1,4 +1,8 @@
 import re
+import json
+import math
+import tempfile
+import warnings
 import subprocess
 import time
 from pathlib import Path
@@ -6,6 +10,7 @@ from pathlib import Path
 from checkpoint_store import build_job_id, get_job_dir
 from edge_tts_service import probe_duration
 from models import RecapClip
+from timing import narration_timing, subtitle_cues
 
 RENDERS_DIR = Path("storage/renders")
 RENDERS_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,13 +54,17 @@ def render_16x9_recap(
     original_audio_volume: float = 0.35,
     voiceover_volume: float = 1.15,
     auto_duck_original_audio: bool = True,
+    video_only: bool = False,
 ) -> dict:
     src_path = Path(source_video_path)
     if not src_path.exists():
         raise FileNotFoundError(f"Source video not found: {src_path}")
 
     resolved_job_id = job_id or build_job_id(source_video_path, 20)
-    work_dir = get_job_dir(resolved_job_id) / "render_cache"
+    if not clips:
+        raise ValueError("At least one recap clip is required.")
+    # Fresh render directories prevent script/audio/settings edits reusing stale segments.
+    work_dir = Path(tempfile.mkdtemp(prefix="render-", dir=get_job_dir(resolved_job_id)))
     seg_dir = work_dir / "segments"
     seg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -63,33 +72,51 @@ def render_16x9_recap(
     subtitle_timings: list[tuple[float, float, str]] = []
     cumulative_time = 0.0
 
-    for idx, clip in enumerate(clips):
-        src_start = max(0.0, clip.source_start)
-        src_end = max(src_start + 1.0, clip.source_end)
-        raw_src_dur = src_end - src_start
+    planned_segments = []
+    timing_modes = set()
+    previous_end = 0.0
+    source_duration = probe_duration(src_path)
+    for clip in clips:
+        if (not math.isfinite(clip.source_start) or not math.isfinite(clip.source_end) or
+                clip.source_start < previous_end or clip.source_end <= clip.source_start or
+                clip.source_end > source_duration):
+            raise ValueError(f"Clip {clip.id}: source range overlaps or is outside the source video.")
+        previous_end = clip.source_end
+        local_audio = Path(clip.audio_path) if clip.audio_path else None
+        if local_audio is None or not local_audio.is_file():
+            if not video_only:
+                raise ValueError(f"Clip {clip.id}: narration is missing. Generate audio before rendering.")
+            duration = clip.source_end - clip.source_start
+            if duration <= 0:
+                raise ValueError(f"Clip {clip.id}: source end must follow source start.")
+            planned_segments.append((clip, None, duration, 1.0, []))
+            continue
+        metadata_path = local_audio.with_suffix(".json")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+        if metadata.get("text") != clip.burmese_script.strip():
+            raise ValueError(f"Clip {clip.id}: narration changed or audio is unverified. Regenerate narration.")
+        audio_duration = probe_duration(local_audio)
+        try:
+            duration, speed = narration_timing(clip.source_start, clip.source_end, audio_duration)
+        except ValueError as exc:
+            raise ValueError(f"Clip {clip.id}: {exc}") from exc
+        cues, timing_mode = subtitle_cues(clip.burmese_script, audio_duration, metadata.get("boundaries", []))
+        timing_modes.add(timing_mode)
+        planned_segments.append((clip, local_audio, duration, speed, cues))
+    if "approximate" in timing_modes:
+        warnings.warn("Subtitle phrase timing is approximate, based on text length, not speech alignment; review the sample.", stacklevel=2)
 
-        local_audio: Path | None = None
-        clip_duration = max(4.0, clip.target_duration)
+    if include_subtitles:
+        filters = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, check=True)
+        if not re.search(r"\bass\s+V->V", filters.stdout):
+            raise RuntimeError("Burned-in subtitles need FFmpeg with libass. Install a libass-enabled FFmpeg or render with --no-subtitles / include_subtitles=false; the SRT will still be exported.")
 
-        if clip.audio_path and Path(clip.audio_path).exists():
-            local_audio = Path(clip.audio_path)
-            tts_dur = probe_duration(local_audio)
-            clip_duration = max(4.5, min(16.0, tts_dur + 0.40))
-
+    for idx, (clip, local_audio, clip_duration, speed, cues) in enumerate(planned_segments):
+        src_start = clip.source_start
+        raw_src_dur = clip.source_end - src_start
         seg_out = seg_dir / f"seg-{idx:03d}.mp4"
         seg_tmp = seg_dir / f"seg-{idx:03d}.tmp.mp4"
-
-        # Segment-level checkpoint: skip if already rendered cleanly
-        if seg_out.exists() and seg_out.stat().st_size > 10_000:
-            actual_dur = probe_duration(seg_out)
-            segment_paths.append(seg_out)
-            subtitle_timings.append(
-                (cumulative_time, cumulative_time + actual_dur - 0.08, clip.burmese_script.strip())
-            )
-            cumulative_time += actual_dur
-            continue
-
-        speed_ratio = clip_duration / raw_src_dur
+        speed_ratio = 1.0 / speed
         video_filters = [
             "scale=1280:720:force_original_aspect_ratio=increase",
             "crop=1280:720",
@@ -167,14 +194,21 @@ def render_16x9_recap(
         seg_tmp.replace(seg_out)
 
         segment_paths.append(seg_out)
-        subtitle_timings.append(
-            (cumulative_time, cumulative_time + clip_duration - 0.08, clip.burmese_script.strip())
+        subtitle_timings.extend(
+            (cumulative_time + start, cumulative_time + end, text)
+            for start, end, text in cues
         )
+        actual_duration = probe_duration(seg_out)
+        if local_audio and actual_duration < clip_duration - 0.1:
+            raise RuntimeError(f"Clip {clip.id}: rendered segment is shorter than the narration plan; review the source range.")
         cumulative_time += clip_duration
 
     concat_list = work_dir / "concat.txt"
     concat_list.write_text(
-        "\n".join(f"file '{p.resolve().as_posix()}'" for p in segment_paths),
+        "\n".join(
+            f"file '{segment.resolve().as_posix()}'\nduration {planned[2]:.6f}"
+            for segment, planned in zip(segment_paths, planned_segments)
+        ),
         encoding="utf-8",
     )
 
@@ -186,6 +220,7 @@ def render_16x9_recap(
             "-safe", "0",
             "-i", str(concat_list),
             "-c", "copy",
+            "-t", f"{cumulative_time:.6f}",
             str(merged_raw),
         ],
         check=True,
@@ -237,6 +272,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "-crf", "20",
                 "-pix_fmt", "yuv420p",
                 "-c:a", "copy",
+                "-t", f"{cumulative_time:.6f}",
                 "-movflags", "+faststart",
                 str(temp_mp4.resolve()),
             ],
@@ -249,6 +285,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "ffmpeg", "-y",
                 "-i", str(merged_raw),
                 "-c", "copy",
+                "-t", f"{cumulative_time:.6f}",
                 "-movflags", "+faststart",
                 str(temp_mp4),
             ],
@@ -266,4 +303,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         "file_size_bytes": final_mp4.stat().st_size,
         "width": 1280,
         "height": 720,
+        "subtitle_timing": "approximate" if "approximate" in timing_modes else "tts-boundaries" if timing_modes else "none",
+        "warnings": ["Subtitles use approximate phrase timing; review against the spoken audio."] if "approximate" in timing_modes else [],
     }

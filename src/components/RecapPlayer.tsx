@@ -17,6 +17,8 @@ import type {
   RenderResult,
 } from '../data/recapClips';
 
+import { buildSubtitleCues, getSegmentTiming } from '../data/timing';
+
 export type SubtitleMode = 'burmese' | 'bilingual' | 'off';
 
 interface RecapPlayerProps {
@@ -37,6 +39,7 @@ interface RecapPlayerProps {
   isRendering: boolean;
   renderError: string | null;
   onTriggerRender: () => void;
+  onTriggerSample: () => void;
   fromSrt: boolean;
   exportDisabled: boolean;
 }
@@ -66,6 +69,7 @@ export default function RecapPlayer({
   isRendering,
   renderError,
   onTriggerRender,
+  onTriggerSample,
   fromSrt,
   exportDisabled,
 }: RecapPlayerProps) {
@@ -79,24 +83,21 @@ export default function RecapPlayer({
   const activeAudio = audioMap[activeClip.id];
 
   const getClipEffectiveDuration = (clip: RecapClip) => {
-    if (fromSrt) return clip.targetDuration;
     const audioDur = audioMap[clip.id]?.durationSec;
-    if (audioDur && audioDur > 0) {
-      return Math.max(2.5, Math.min(14, audioDur + 0.25));
-    }
-    return clip.targetDuration;
+    return audioDur && audioDur > 0 ? Math.ceil((audioDur + 0.25) * 25) / 25 : clip.sourceEnd - clip.sourceStart;
   };
-
-  const totalRecapDuration = fromSrt ? clips[clips.length - 1].sourceEnd : clips.reduce(
-    (sum, c) => sum + getClipEffectiveDuration(c),
-    0
-  );
-
-  const elapsedBeforeActive = fromSrt ? activeClip.sourceStart : clips
-    .slice(0, activeClipIndex)
-    .reduce((sum, c) => sum + getClipEffectiveDuration(c), 0);
-
+  let timingError: string | null = null;
+  let activeSpeed = 1;
+  if (activeAudio?.status === 'ready') {
+    try { activeSpeed = getSegmentTiming(activeClip, activeAudio.durationSec).speed; }
+    catch (error) { timingError = (error as Error).message; }
+  }
+  const totalRecapDuration = clips.reduce((sum, clip) => sum + getClipEffectiveDuration(clip), 0);
+  const elapsedBeforeActive = clips.slice(0, activeClipIndex)
+    .reduce((sum, clip) => sum + getClipEffectiveDuration(clip), 0);
   const currentClipDuration = getClipEffectiveDuration(activeClip);
+  const subtitleCue = (activeAudio?.subtitleCues ?? buildSubtitleCues(activeClip.burmeseScript, activeAudio?.durationSec ?? 0))
+    .find((cue) => cue.start <= clipProgress * currentClipDuration && cue.end > clipProgress * currentClipDuration);
   const currentElapsed =
     elapsedBeforeActive + clipProgress * currentClipDuration;
 
@@ -110,9 +111,8 @@ export default function RecapPlayer({
     const clip = clips[activeClipIndex];
     if (!clip) return;
 
-    const rawDur = fromSrt ? clip.targetDuration : Math.max(1, clip.sourceEnd - clip.sourceStart);
-    const targetDur = getClipEffectiveDuration(clip);
-    const rate = Math.max(0.6, Math.min(1.75, rawDur / targetDur));
+    if (timingError) { video.pause(); voiceEl?.pause(); setIsPlaying(false); return; }
+    const rate = activeSpeed;
 
     video.currentTime = clip.sourceStart;
     video.playbackRate = rate;
@@ -125,9 +125,7 @@ export default function RecapPlayer({
       if (url) {
         voiceEl.src = url;
         voiceEl.currentTime = 0;
-        voiceEl.playbackRate = fromSrt
-          ? Math.max(1, Math.min(4, (audioMap[clip.id]?.durationSec ?? 0) / clip.targetDuration))
-          : 1;
+        voiceEl.playbackRate = 1;
         voiceEl.volume = isMuted ? 0 : 1;
       } else {
         voiceEl.removeAttribute('src');
@@ -140,7 +138,7 @@ export default function RecapPlayer({
         voiceEl.play().catch(() => {});
       }
     }
-  }, [activeClipIndex, playerMode, sourceVideoUrl]);
+  }, [activeClipIndex, playerMode, sourceVideoUrl, activeAudio?.audioUrl, activeClip.burmeseScript, activeClip.sourceStart, activeClip.sourceEnd]);
 
   // Sync mute & volume live
   useEffect(() => {
@@ -161,33 +159,35 @@ export default function RecapPlayer({
     const voiceEl = voiceAudioRef.current;
     if (!video) return;
 
+    if (timingError) { video.pause(); voiceEl?.pause(); setIsPlaying(false); return; }
     if (isPlaying) {
       if (
         video.currentTime < activeClip.sourceStart ||
-        video.currentTime >= activeClip.sourceEnd - 0.08
+        video.currentTime >= activeClip.sourceEnd
       ) {
         video.currentTime = activeClip.sourceStart;
       }
-      const rawDur = fromSrt ? activeClip.targetDuration : Math.max(1, activeClip.sourceEnd - activeClip.sourceStart);
-      const targetDur = getClipEffectiveDuration(activeClip);
-      video.playbackRate = Math.max(0.6, Math.min(1.75, rawDur / targetDur));
+      video.playbackRate = activeSpeed;
       video.play().catch(() => {});
 
       if (voiceEl && activeAudio?.audioUrl) {
         if (!voiceEl.src.endsWith(activeAudio.audioUrl)) {
           voiceEl.src = activeAudio.audioUrl;
         }
-        if (fromSrt) {
-          voiceEl.playbackRate = Math.max(1, Math.min(4, (activeAudio.durationSec ?? 0) / activeClip.targetDuration));
-          voiceEl.currentTime = Math.max(0, video.currentTime - activeClip.sourceStart) * voiceEl.playbackRate;
+        voiceEl.playbackRate = 1;
+        const elapsed = Math.max(0, video.currentTime - activeClip.sourceStart) / activeSpeed;
+        if (elapsed < (activeAudio.durationSec ?? 0)) {
+          voiceEl.currentTime = elapsed;
+          voiceEl.play().catch(() => {});
+        } else {
+          voiceEl.pause();
         }
-        voiceEl.play().catch(() => {});
       }
     } else {
       video.pause();
       if (voiceEl) voiceEl.pause();
     }
-  }, [isPlaying, playerMode]);
+  }, [isPlaying, playerMode, timingError]);
 
   // Advance clip cleanly on timeupdate
   const handleTimeUpdate = () => {
@@ -195,15 +195,15 @@ export default function RecapPlayer({
     const video = videoRef.current;
     if (!video) return;
 
-    const span = fromSrt ? activeClip.targetDuration : Math.max(0.5, activeClip.sourceEnd - activeClip.sourceStart);
+    const span = activeClip.sourceEnd - activeClip.sourceStart;
     const progress = Math.max(
       0,
       Math.min(1, (video.currentTime - activeClip.sourceStart) / span)
     );
     setClipProgress(progress);
 
-    if (isPlaying && video.currentTime >= activeClip.sourceEnd - 0.06) {
-      if (!fromSrt && activeClipIndex < clips.length - 1) {
+    if (isPlaying && video.currentTime >= activeClip.sourceEnd - 0.005) {
+      if (activeClipIndex < clips.length - 1) {
         onSelectClip(activeClipIndex + 1);
       } else {
         setIsPlaying(false);
@@ -211,6 +211,14 @@ export default function RecapPlayer({
       }
     }
   };
+
+  useEffect(() => {
+    if (!isPlaying || playerMode !== 'storyboard') return;
+    let frame: number;
+    const tick = () => { handleTimeUpdate(); frame = requestAnimationFrame(tick); };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [isPlaying, playerMode, activeClipIndex, activeSpeed]);
 
   const handleRestart = () => {
     onSelectClip(0);
@@ -270,6 +278,8 @@ export default function RecapPlayer({
         </div>
       </div>
 
+      {timingError && <p role="alert" className="text-xs text-rose-400">{timingError}</p>}
+      <p className="text-xs text-slate-400">{activeAudio?.status === 'ready' ? (activeAudio.subtitleTiming === 'aligned' ? 'Burmese phrases follow narration timing metadata. Review the sample before a full export.' : 'Phrase subtitles use approximate timing, not speech alignment. Review the sample before a full export.') : 'Generate narration to verify timing and preview phrase subtitles.'}</p>
       {/* 16:9 Widescreen Viewport */}
       <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden border border-slate-800">
         {playerMode === 'rendered' && renderResult ? (
@@ -304,17 +314,19 @@ export default function RecapPlayer({
             )}
 
             {/* Burmese / Bilingual Subtitle Overlay */}
-            {subtitleMode !== 'off' && (
+            {subtitleMode !== 'off' && subtitleCue && (
               <div className="pointer-events-none absolute inset-x-0 bottom-3 md:bottom-4 px-5 md:px-10 flex flex-col items-center text-center gap-1.5">
                 <p
                   lang="my"
                   className="font-myanmar whitespace-pre-line text-sm sm:text-base md:text-[18px] font-semibold leading-relaxed text-white drop-shadow-[0_2px_6px_rgba(0,0,0,0.95)] bg-black/60 px-3.5 py-1.5 rounded-md max-w-3xl"
                 >
-                  {activeClip.burmeseScript}
+                  {subtitleCue.burmese}
                 </p>
+
                 {subtitleMode === 'bilingual' && !fromSrt && (
                   <p className="text-[11px] sm:text-xs font-medium text-slate-200 bg-black/55 px-2.5 py-0.5 rounded max-w-2xl">
-                    {activeClip.englishScript}
+                    {buildSubtitleCues(activeClip.englishScript, activeAudio?.durationSec ?? 0)
+                      .find((cue) => cue.start <= clipProgress * currentClipDuration && cue.end > clipProgress * currentClipDuration)?.burmese}
                   </p>
                 )}
               </div>
@@ -362,7 +374,7 @@ export default function RecapPlayer({
                 ) : (
                   <>
                     <Play className="w-4 h-4" />
-                    <span>{fromSrt ? 'Play Cue' : 'Play Recap'}</span>
+                    <span>Play Recap</span>
                   </>
                 )}
               </button>
@@ -598,6 +610,10 @@ export default function RecapPlayer({
               </a>
             </>
           )}
+          <button type="button" onClick={onTriggerSample} disabled={exportDisabled}
+            className="h-10 px-3 rounded-lg border border-slate-700 bg-slate-800 text-xs disabled:opacity-60">
+            Export first-segment sample
+          </button>
           <button
             type="button"
             onClick={onTriggerRender}

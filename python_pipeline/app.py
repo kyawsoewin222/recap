@@ -65,6 +65,7 @@ def render_video(req: RenderRequest):
             original_audio_volume=req.original_audio_volume,
             voiceover_volume=req.voiceover_volume,
             auto_duck_original_audio=req.auto_duck_original_audio,
+            video_only=req.video_only,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

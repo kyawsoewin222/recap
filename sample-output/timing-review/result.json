@@ -1,0 +1,10 @@
+{
+  "videoUrl": "/renders/srt-recap-1795143509511-7289e9-sample-1795143509511.mp4",
+  "srtUrl": "/renders/srt-recap-1795143509511-7289e9-sample-1795143509511.srt",
+  "durationSec": 5.701328,
+  "fileSizeBytes": 766903,
+  "width": 1280,
+  "height": 720,
+  "subtitleTiming": "aligned",
+  "warning": "Subtitles use provider speech boundaries. Review the sample before processing the full project."
+}

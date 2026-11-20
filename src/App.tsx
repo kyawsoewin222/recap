@@ -2,6 +2,7 @@ import { Upload } from 'lucide-react';
 import { useEffect, useRef, useState, type ChangeEvent } from 'react';
 import RecapPlayer, { type SubtitleMode } from './components/RecapPlayer';
 import ScriptPanel from './components/ScriptPanel';
+import { getSegmentTiming } from './data/timing';
 import {
   INITIAL_RECAP_CLIPS,
   SOURCE_VIDEO_URL,
@@ -13,6 +14,7 @@ import {
 export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const episodeChanged = useRef(false);
+  const assetRevision = useRef(0);
   const [scriptSource, setScriptSource] = useState<'gemini' | 'srt'>('gemini');
   const [activeScriptSource, setActiveScriptSource] = useState<'gemini' | 'srt'>('gemini');
   const [srtFile, setSrtFile] = useState<File | null>(null);
@@ -62,20 +64,30 @@ export default function App() {
 
   const handleUpdateClip = (
     clipId: number,
-    patch: Partial<Pick<RecapClip, 'burmeseScript' | 'englishScript'>>
+    patch: Partial<Pick<RecapClip, 'burmeseScript' | 'englishScript' | 'sourceStart' | 'sourceEnd'>>
   ) => {
-    setClips((prev) =>
-      prev.map((c) => (c.id === clipId ? { ...c, ...patch } : c))
-    );
-    if (activeScriptSource === 'srt' && patch.burmeseScript !== undefined) {
-      setAudioMap((prev) => ({ ...prev, [clipId]: { status: 'idle' } }));
+    const updated = clips.map((clip) => clip.id === clipId ? { ...clip, ...patch } : clip);
+    if (updated.some((clip, index) => !Number.isFinite(clip.sourceStart) || !Number.isFinite(clip.sourceEnd) ||
+      clip.sourceStart < 0 || clip.sourceEnd <= clip.sourceStart || (index > 0 && clip.sourceStart < updated[index - 1].sourceEnd))) {
+      setRenderError('Choose ordered, nonoverlapping source ranges with start before end. Stay within the relevant scene.');
+      return;
     }
+    setClips(updated);
+    assetRevision.current++;
+    episodeChanged.current = true;
+    setAudioMap((prev) => Object.fromEntries(Object.entries(prev).map(([id, audio]) => [id,
+      (Number(id) === clipId && patch.burmeseScript !== undefined) || audio.status === 'generating'
+        ? { status: 'idle' } : audio])));
+    setRenderResult(null);
+    setPlayerMode('storyboard');
+    setRenderError(null);
   };
 
   const generateVoiceForClip = async (
     clip: RecapClip,
     source = activeScriptSource
   ): Promise<ClipAudioState> => {
+    const revision = assetRevision.current;
     setAudioMap((prev) => ({
       ...prev,
       [clip.id]: { ...prev[clip.id], status: 'generating', error: undefined },
@@ -96,10 +108,14 @@ export default function App() {
         throw new Error(data.error || 'Voiceover generation failed.');
       }
 
+      if (revision !== assetRevision.current) throw new Error('Narration changed during generation. Generate it again.');
+      if (!Number.isFinite(data.durationSec) || data.durationSec <= 0) throw new Error('Narration duration could not be measured. Generate it again.');
       const audio: ClipAudioState = {
         status: 'ready',
         audioUrl: data.audioUrl,
         durationSec: data.durationSec,
+        subtitleCues: data.subtitleCues,
+        subtitleTiming: data.subtitleTiming,
       };
       setAudioMap((prev) => ({ ...prev, [clip.id]: audio }));
       return audio;
@@ -107,15 +123,17 @@ export default function App() {
       const message =
         err instanceof Error ? err.message : 'Voiceover generation failed.';
       const audio: ClipAudioState = { status: 'error', error: message };
-      setAudioMap((prev) => ({ ...prev, [clip.id]: audio }));
+      if (revision === assetRevision.current) setAudioMap((prev) => ({ ...prev, [clip.id]: audio }));
       return audio;
     }
   };
 
   const handleGenerateAllAudio = async () => {
+    const revision = assetRevision.current;
     setIsGeneratingAll(true);
     try {
       for (let i = 0; i < clips.length; i++) {
+        if (revision !== assetRevision.current) break;
         setGenerationProgressText(`Generating ${i + 1}/${clips.length}`);
         await generateVoiceForClip(clips[i]);
       }
@@ -126,6 +144,7 @@ export default function App() {
   };
 
   const handleTranslateClip = async (clip: RecapClip) => {
+    const revision = assetRevision.current;
     setTranslatingClipId(clip.id);
     try {
       const response = await fetch('/api/translate', {
@@ -137,7 +156,7 @@ export default function App() {
       if (!response.ok) {
         throw new Error(data.error || 'Translation failed.');
       }
-      handleUpdateClip(clip.id, { burmeseScript: data.burmeseScript });
+      if (revision === assetRevision.current) handleUpdateClip(clip.id, { burmeseScript: data.burmeseScript });
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : 'Translation failed.';
@@ -158,12 +177,15 @@ export default function App() {
     targetClips: RecapClip[],
     targetSourceUrl: string,
     targetAudioMap: Record<number, ClipAudioState>,
-    source = activeScriptSource
+    source = activeScriptSource,
+    sample = false
   ) => {
+    const revision = assetRevision.current;
     setIsRendering(true);
     setRenderError(null);
 
     try {
+      for (const clip of targetClips) getSegmentTiming(clip, targetAudioMap[clip.id]?.durationSec);
       const payloadClips = targetClips.map((c) => ({
         id: c.id,
         sourceStart: c.sourceStart,
@@ -180,6 +202,7 @@ export default function App() {
         body: JSON.stringify({
           clips: payloadClips,
           scriptSource: source,
+          sample,
           sourceVideoUrl: targetSourceUrl,
           includeSubtitles: subtitleMode !== 'off',
           maskBottomSubtitles,
@@ -193,8 +216,10 @@ export default function App() {
         throw new Error(data.error || 'Failed to render 16:9 recap video.');
       }
 
-      setRenderResult(data);
-      setPlayerMode('rendered');
+      if (revision === assetRevision.current) {
+        setRenderResult(data);
+        setPlayerMode('rendered');
+      }
     } catch (err: unknown) {
       const message =
         err instanceof Error
@@ -206,39 +231,40 @@ export default function App() {
     }
   };
 
-  const handleRenderVideo = async () => {
+  const handleRenderVideo = async (sample = false) => {
     if (busy) return;
-    if (activeScriptSource === 'srt') {
-      setIsProcessingEpisode(true);
-      setRenderError(null);
-      try {
-        await renderSrt(clips, sourceVideoUrl, audioMap);
-      } catch (err) {
-        setRenderError(err instanceof Error ? err.message : 'Could not render SRT recap.');
-      } finally {
-        setUploadStatusText(null);
-        setIsProcessingEpisode(false);
-      }
-      return;
+    setIsProcessingEpisode(true);
+    setRenderError(null);
+    try {
+      await renderSrt(sample ? clips.slice(0, 1) : clips, sourceVideoUrl, audioMap, activeScriptSource, sample);
+    } catch (err) {
+      setRenderError(err instanceof Error ? err.message : 'Could not render recap.');
+    } finally {
+      setUploadStatusText(null);
+      setIsProcessingEpisode(false);
     }
-    await renderVideoWithParams(clips, sourceVideoUrl, audioMap);
   };
 
   const renderSrt = async (
     targetClips: RecapClip[],
     targetSourceUrl: string,
-    currentAudio: Record<number, ClipAudioState>
+    currentAudio: Record<number, ClipAudioState>,
+    source = activeScriptSource,
+    sample = false
   ) => {
+    const revision = assetRevision.current;
     const narration = { ...currentAudio };
     for (const [index, clip] of targetClips.entries()) {
+      if (revision !== assetRevision.current) throw new Error('Narration changed. Review it and export again.');
       if (narration[clip.id]?.status === 'ready') continue;
       setUploadStatusText(`Generating Burmese narration ${index + 1}/${targetClips.length}…`);
-      const audio = await generateVoiceForClip(clip, 'srt');
+      const audio = await generateVoiceForClip(clip, source);
       if (audio.status !== 'ready') throw new Error(`Cue ${index + 1}: ${audio.error}`);
       narration[clip.id] = audio;
     }
+    if (revision !== assetRevision.current) throw new Error('Narration changed. Review it and export again.');
     setUploadStatusText(`Rendering ${targetClips.length} narrated scenes…`);
-    await renderVideoWithParams(targetClips, targetSourceUrl, narration, 'srt');
+    await renderVideoWithParams(targetClips, targetSourceUrl, narration, source, sample);
   };
 
   const processEpisode = async (file?: File) => {
@@ -309,6 +335,7 @@ export default function App() {
 
       const generatedClips: RecapClip[] = analyzeData.clips;
       episodeChanged.current = true;
+      assetRevision.current++;
       if (file) {
         const cleanTitle = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ');
         setEpisodeTitle(`${cleanTitle} — Burmese 16:9 Short Recap`);
@@ -320,15 +347,7 @@ export default function App() {
       setRenderResult(null);
       setPlayerMode('storyboard');
       setClips(generatedClips);
-      if (useSrt) {
-        await renderSrt(generatedClips, targetSourceUrl, {});
-        return;
-      }
-      setUploadStatusText(
-        `Rendering clean video-only 16:9 MP4 (${generatedClips.length} segments)...`
-      );
-
-      await renderVideoWithParams(generatedClips, targetSourceUrl, {}, 'gemini');
+      setGenerationProgressText('Review narration and export a sample before rendering the full project.');
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : 'Failed to process new episode.';
@@ -395,7 +414,7 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={handleRenderVideo}
+              onClick={() => void handleRenderVideo()}
               disabled={busy}
               className="h-10 px-4 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-60 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0"
             >
@@ -435,7 +454,10 @@ export default function App() {
                 <select className="rounded border border-slate-700 bg-slate-900 p-2"
                   value={srtVoice} disabled={busy} onChange={(e) => {
                     setSrtVoice(e.target.value);
-                    if (activeScriptSource === 'srt') setAudioMap({});
+                    if (activeScriptSource === 'srt') {
+                      assetRevision.current++;
+                      setAudioMap({}); setRenderResult(null); setPlayerMode('storyboard');
+                    }
                   }}>
                   <option value="my-MM-ThihaNeural">Thiha (male)</option>
                   <option value="my-MM-NilarNeural">Nilar (female)</option>
@@ -446,11 +468,12 @@ export default function App() {
                 Use Current Video
               </button>
               <p className="w-full text-xs text-slate-400">
-                Use the current video or upload a matching episode. Narration follows the cue times and pauses between cues.
+                Use the current video or upload a matching episode. Cue windows select footage. Final segment timing follows measured narration; unsuitable fits require review.
               </p>
             </>
           )}
         </div>
+        {generationProgressText && !isGeneratingAll && <p className="text-sm text-slate-300">{generationProgressText}</p>}
         {uploadStatusText && (
           <div className="rounded-xl border border-rose-500/40 bg-rose-950/25 px-4 py-3 text-xs font-medium text-rose-200">
             {uploadStatusText}
@@ -486,7 +509,8 @@ export default function App() {
             onPlayerModeChange={setPlayerMode}
             isRendering={isRendering}
             renderError={renderError}
-            onTriggerRender={handleRenderVideo}
+            onTriggerRender={() => void handleRenderVideo()}
+            onTriggerSample={() => void handleRenderVideo(true)}
             fromSrt={activeScriptSource === 'srt'}
             exportDisabled={busy}
           />
@@ -496,7 +520,11 @@ export default function App() {
             activeClipIndex={activeClipIndex}
             audioMap={audioMap}
             selectedVoice={selectedVoice}
-            onVoiceChange={setSelectedVoice}
+            onVoiceChange={(voice) => {
+              setSelectedVoice(voice);
+              assetRevision.current++;
+              setAudioMap({}); setRenderResult(null); setPlayerMode('storyboard');
+            }}
             onSelectClip={setActiveClipIndex}
             onUpdateClip={handleUpdateClip}
             onGenerateClipAudio={async (clip) => { await generateVoiceForClip(clip); }}

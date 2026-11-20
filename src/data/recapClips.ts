@@ -9,6 +9,8 @@ export interface RecapClip {
 }
 
 export interface ClipAudioState {
+  subtitleCues?: Array<{ start: number; end: number; burmese: string }>;
+  subtitleTiming?: 'aligned' | 'approximate';
   audioUrl?: string;
   durationSec?: number;
   status: 'idle' | 'generating' | 'ready' | 'error';

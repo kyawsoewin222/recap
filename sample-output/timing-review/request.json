@@ -1,0 +1,17 @@
+{
+  "clips": [
+    {
+      "id": 1,
+      "sourceStart": 0,
+      "sourceEnd": 6.2,
+      "targetDuration": 4,
+      "burmeseScript": "လုရှောင်က စာချုပ်မချုပ်ခင် ဖမ်းခေါ်ခံရတဲ့ ပြည်သူထောင်ချီ ဘယ်မှာလဲလို့ မေးလိုက်ပါတယ်။",
+      "audioUrl": "/tts/clip-1-426e720f64eb.mp3"
+    }
+  ],
+  "sourceVideoUrl": "/uploads/timing-review-source.mp4",
+  "scriptSource": "srt",
+  "includeSubtitles": false,
+  "sourceAudioVolume": 0.14,
+  "sample": true
+}
