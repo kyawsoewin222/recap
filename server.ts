@@ -6,8 +6,10 @@ import express from 'express';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { pipeline } from 'node:stream/promises';
 import { promisify } from 'util';
 import { createServer as createViteServer } from 'vite';
+import { parseSrt } from './src/data/srt.ts';
 
 dotenv.config();
 
@@ -144,11 +146,11 @@ function formatAssTime(seconds: number): string {
 }
 
 function formatSrtTime(seconds: number): string {
-  const clamped = Math.max(0, seconds);
-  const h = Math.floor(clamped / 3600);
-  const m = Math.floor((clamped % 3600) / 60);
-  const s = Math.floor(clamped % 60);
-  const ms = Math.floor((clamped - Math.floor(clamped)) * 1000);
+  const clamped = Math.round(Math.max(0, seconds) * 1000);
+  const h = Math.floor(clamped / 3600000);
+  const m = Math.floor((clamped % 3600000) / 60000);
+  const s = Math.floor((clamped % 60000) / 1000);
+  const ms = clamped % 1000;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
 }
 
@@ -169,6 +171,72 @@ interface RenderClipInput {
   burmeseScript: string;
   englishScript?: string;
   audioUrl?: string;
+}
+
+async function renderNarratedTimeline(
+  source: string,
+  hasAudio: boolean,
+  clips: RenderClipInput[],
+  workDir: string,
+  output: string,
+  settings: { maskBottomSubtitles: boolean; sourceAudioVolume: number; voiceoverVolume: number }
+) {
+  const sampleRate = 48000;
+  const duration = clips[clips.length - 1].sourceEnd;
+  const narration = path.join(workDir, 'narration.pcm');
+  const cueAudio = path.join(workDir, 'cue.pcm');
+  // Unwritten samples remain silent between cues.
+  const track = await fs.promises.open(narration, 'w');
+  try {
+    await track.truncate(Math.round(duration * sampleRate) * 2);
+  } finally {
+    await track.close();
+  }
+
+  for (const clip of clips) {
+    const audio = path.join(TTS_DIR, path.basename(clip.audioUrl!));
+    const span = clip.sourceEnd - clip.sourceStart;
+    const speed = Math.max(1, (await probeDuration(audio)) / span);
+    const tempo: string[] = [];
+    let remaining = speed;
+    while (remaining > 2) {
+      tempo.push('atempo=2');
+      remaining /= 2;
+    }
+    if (remaining > 1) tempo.push(`atempo=${remaining.toFixed(6)}`);
+    const startSample = Math.round(clip.sourceStart * sampleRate);
+    const endSample = Math.round(clip.sourceEnd * sampleRate);
+    await execFileAsync('ffmpeg', [
+      '-v', 'error', '-y', '-i', audio,
+      '-af', [...tempo, `aresample=${sampleRate}`, `atrim=end_sample=${endSample - startSample}`].join(','),
+      '-ac', '1', '-f', 's16le', cueAudio,
+    ]);
+    await pipeline(
+      fs.createReadStream(cueAudio),
+      fs.createWriteStream(narration, { flags: 'r+', start: startSample * 2 }),
+    );
+  }
+
+  const videoFilters = [
+    'scale=1280:720:force_original_aspect_ratio=increase', 'crop=1280:720', 'setsar=1', 'fps=25',
+  ];
+  if (settings.maskBottomSubtitles) {
+    videoFilters.push('drawbox=x=0:y=592:w=1280:h=128:color=black@0.82:t=fill');
+  }
+  const background = Math.max(0, Math.min(1, settings.sourceAudioVolume));
+  const voice = Math.max(0, Math.min(2, settings.voiceoverVolume));
+  const voiceFilter = `[1:a]volume=${voice},aformat=channel_layouts=stereo`;
+  const audioFilter = hasAudio
+    ? `${voiceFilter}[vo];[0:a:0]volume=${background},aformat=sample_rates=${sampleRate}:channel_layouts=stereo[bg];[vo][bg]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:level=0:latency=1[aout]`
+    : `${voiceFilter},alimiter=limit=0.95:level=0:latency=1[aout]`;
+
+  await execFileAsync('ffmpeg', [
+    '-v', 'error', '-y', '-i', source,
+    '-f', 's16le', '-ar', String(sampleRate), '-ac', '1', '-i', narration,
+    '-vf', videoFilters.join(','), '-filter_complex', audioFilter, '-map', '0:v:0', '-map', '[aout]',
+    '-t', duration.toFixed(3), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21',
+    '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', output,
+  ]);
 }
 
 async function startServer() {
@@ -636,6 +704,57 @@ Rules:
     }
   });
 
+  app.post('/api/import-srt', async (req, res) => {
+    const { sourceVideoUrl, srt } = req.body;
+    if (typeof srt !== 'string' || Buffer.byteLength(srt) > 1024 * 1024) {
+      res.status(400).json({ error: 'Choose an SRT file of 1 MB or less.' });
+      return;
+    }
+    try {
+      const sourcePath = resolveSourceVideoPath(sourceVideoUrl);
+      if (!fs.existsSync(sourcePath)) {
+        res.status(404).json({ error: 'Upload a matching source video before importing the SRT.' });
+        return;
+      }
+      const { durationSec } = await probeVideoInfo(sourcePath);
+      if (durationSec <= 0) throw new Error('Could not read the source video duration.');
+      res.json({ clips: parseSrt(srt, durationSec) });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Could not import SRT.' });
+    }
+  });
+
+  app.post('/api/srt-tts', async (req, res) => {
+    const { clipId, text, voiceName } = req.body;
+    if (!Number.isSafeInteger(clipId) || clipId < 1 || typeof text !== 'string' ||
+        !text.trim() || !['my-MM-ThihaNeural', 'my-MM-NilarNeural'].includes(voiceName)) {
+      res.status(400).json({ error: 'A cue number, narration text, and Burmese voice are required.' });
+      return;
+    }
+    try {
+      const python = process.env.EDGE_TTS_PYTHON || 'python3';
+      const script = path.join(ROOT_DIR, 'python_pipeline', 'edge_tts_service.py');
+      const job = execFileAsync(python, [script, String(clipId), voiceName, TTS_DIR], {
+        timeout: 120_000,
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      });
+      job.child.stdin?.on('error', () => {});
+      job.child.stdin?.end(text, 'utf8');
+      const { stdout } = await job;
+      const name = stdout.trim();
+      if (!/^clip-\d+-[a-f0-9]{12}\.mp3$/.test(name)) throw new Error('Unexpected narration output.');
+      res.json({ audioUrl: `/tts/${name}`, durationSec: await probeDuration(path.join(TTS_DIR, name)) });
+    } catch (err) {
+      console.error('SRT narration failed:', err);
+      const missing = err instanceof Error && /No module named 'edge_tts'|ENOENT/.test(err.message);
+      res.status(502).json({
+        error: missing
+          ? 'Edge TTS is unavailable. Install edge-tts in the Python environment used by the server.'
+          : 'Edge TTS could not generate this cue. Check the connection and try again.',
+      });
+    }
+  });
+
   app.post('/api/render', async (req, res) => {
     const tempDir = path.join(
       RENDERS_DIR,
@@ -650,6 +769,7 @@ Rules:
         maskBottomSubtitles = true,
         sourceAudioVolume = 0.14,
         voiceoverVolume = 1.0,
+        scriptSource = 'gemini',
       } = req.body as {
         clips: RenderClipInput[];
         sourceVideoUrl?: string;
@@ -657,7 +777,9 @@ Rules:
         maskBottomSubtitles?: boolean;
         sourceAudioVolume?: number;
         voiceoverVolume?: number;
+        scriptSource?: 'gemini' | 'srt';
       };
+      const fromSrt = scriptSource === 'srt';
 
       const sourcePath = resolveSourceVideoPath(sourceVideoUrl);
       if (!fs.existsSync(sourcePath)) {
@@ -671,184 +793,208 @@ Rules:
         res.status(400).json({ error: 'At least one recap clip is required.' });
         return;
       }
+      if (fromSrt) {
+        const invalid = clips.findIndex((clip, i) =>
+          !clip || !Number.isFinite(clip.sourceStart) || !Number.isFinite(clip.sourceEnd) ||
+          clip.sourceStart < 0 || clip.sourceEnd <= clip.sourceStart ||
+          clip.sourceEnd > sourceInfo.durationSec || typeof clip.burmeseScript !== 'string' ||
+          (i > 0 && clip.sourceStart < clips[i - 1].sourceEnd) ||
+          !clip.burmeseScript.trim() || typeof clip.audioUrl !== 'string' ||
+          !/^\/tts\/clip-\d+-[a-f0-9]{12}\.mp3$/.test(clip.audioUrl) ||
+          !fs.existsSync(path.join(TTS_DIR, path.basename(clip.audioUrl))));
+        if (invalid >= 0) {
+          res.status(400).json({ error: `Cue ${invalid + 1} needs a valid source range and generated narration.` });
+          return;
+        }
+      }
 
       fs.mkdirSync(tempDir, { recursive: true });
 
-      const segmentPaths: string[] = [];
-      const subtitleTimings: Array<{
-        start: number;
-        end: number;
-        burmese: string;
-      }> = [];
+      const mergedRawPath = path.join(tempDir, 'merged.mp4');
+      const subtitleTimings: Array<{ start: number; end: number; burmese: string }> = [];
 
-      let cumulativeTime = 0;
+      if (fromSrt) {
+        await renderNarratedTimeline(sourcePath, sourceInfo.hasAudio, clips, tempDir, mergedRawPath, {
+          maskBottomSubtitles, sourceAudioVolume, voiceoverVolume,
+        });
+        subtitleTimings.push(...clips.map((clip) => ({
+          start: clip.sourceStart,
+          end: clip.sourceEnd,
+          burmese: clip.burmeseScript.trim(),
+        })));
+      } else {
+        const segmentPaths: string[] = [];
 
-      for (let i = 0; i < clips.length; i++) {
-        const clip = clips[i];
-        const srcStart = Math.max(0, Number(clip.sourceStart));
-        const srcEnd = Math.max(srcStart + 1, Number(clip.sourceEnd));
-        const rawSrcDur = srcEnd - srcStart;
+        let cumulativeTime = 0;
 
-        let localAudioPath: string | null = null;
-        let clipDuration = Math.max(2.5, Number(clip.targetDuration) || 4.5);
+        for (let i = 0; i < clips.length; i++) {
+          const clip = clips[i];
+          const srcStart = Math.max(0, Number(clip.sourceStart));
+          const srcEnd = Math.max(srcStart + 1, Number(clip.sourceEnd));
+          const rawSrcDur = srcEnd - srcStart;
 
-        if (clip.audioUrl && clip.audioUrl.startsWith('/tts/')) {
-          const candidate = path.join(TTS_DIR, path.basename(clip.audioUrl));
-          if (fs.existsSync(candidate)) {
-            localAudioPath = candidate;
-            const ttsDur = await probeDuration(candidate);
-            clipDuration = Math.max(2.5, Math.min(14, ttsDur + 0.25));
+          let localAudioPath: string | null = null;
+          let clipDuration = Math.max(2.5, Number(clip.targetDuration) || 4.5);
+
+          if (clip.audioUrl && clip.audioUrl.startsWith('/tts/')) {
+            const candidate = path.join(TTS_DIR, path.basename(clip.audioUrl));
+            if (fs.existsSync(candidate)) {
+              localAudioPath = candidate;
+              const ttsDur = await probeDuration(candidate);
+              clipDuration = Math.max(2.5, Math.min(14, ttsDur + 0.25));
+            }
           }
-        }
 
-        const speedRatio = clipDuration / rawSrcDur;
-        const segOutPath = path.join(
-          tempDir,
-          `seg-${String(i).padStart(2, '0')}.mp4`
-        );
-
-        const videoFilters = [
-          'scale=1280:720:force_original_aspect_ratio=increase',
-          'crop=1280:720',
-          'fps=25',
-          `setpts=${speedRatio.toFixed(6)}*PTS`,
-        ];
-
-        if (maskBottomSubtitles) {
-          videoFilters.push(
-            'drawbox=x=0:y=592:w=1280:h=128:color=black@0.82:t=fill'
+          const speedRatio = clipDuration / rawSrcDur;
+          const segOutPath = path.join(
+            tempDir,
+            `seg-${String(i).padStart(2, '0')}.mp4`
           );
-        }
 
-        const args: string[] = [
-          '-y',
-          '-ss',
-          srcStart.toFixed(3),
-          '-t',
-          rawSrcDur.toFixed(3),
-          '-i',
-          sourcePath,
-        ];
+          const videoFilters = [
+            'scale=1280:720:force_original_aspect_ratio=increase',
+            'crop=1280:720',
+            'fps=25',
+            `setpts=${speedRatio.toFixed(6)}*PTS`,
+          ];
 
-        if (!sourceInfo.hasAudio) {
+          if (maskBottomSubtitles) {
+            videoFilters.push(
+              'drawbox=x=0:y=592:w=1280:h=128:color=black@0.82:t=fill'
+            );
+          }
+
+          const args: string[] = [
+            '-y',
+            '-ss',
+            srcStart.toFixed(3),
+            '-t',
+            rawSrcDur.toFixed(3),
+            '-i',
+            sourcePath,
+          ];
+
+          if (!sourceInfo.hasAudio) {
+            args.push(
+              '-f',
+              'lavfi',
+              '-t',
+              clipDuration.toFixed(3),
+              '-i',
+              'anullsrc=channel_layout=stereo:sample_rate=48000'
+            );
+          }
+
+          const voInputIndex = sourceInfo.hasAudio ? 1 : 2;
+          if (localAudioPath) {
+            args.push('-i', localAudioPath);
+          }
+
+          const clampedBgVol = Math.max(0, Math.min(1, Number(sourceAudioVolume)));
+          const clampedVoVol = Math.max(0, Math.min(2, Number(voiceoverVolume)));
+
+          const filterParts: string[] = [
+            `[0:v]${videoFilters.join(',')}[vout]`,
+          ];
+
+          const bgSourceRef = sourceInfo.hasAudio ? '[0:a]' : '[1:a]';
+
+          if (localAudioPath) {
+            const bgFilters: string[] = [];
+            const tempo = 1 / speedRatio;
+            if (sourceInfo.hasAudio && tempo >= 0.5 && tempo <= 2.0) {
+              bgFilters.push(`atempo=${tempo.toFixed(4)}`);
+            }
+            bgFilters.push(
+              `volume=${clampedBgVol.toFixed(2)}`,
+              'aformat=sample_rates=48000:channel_layouts=stereo',
+              `apad=whole_dur=${clipDuration.toFixed(3)}`,
+              `atrim=duration=${clipDuration.toFixed(3)}`
+            );
+
+            filterParts.push(`${bgSourceRef}${bgFilters.join(',')}[bg]`);
+            filterParts.push(
+              `[${voInputIndex}:a]volume=${clampedVoVol.toFixed(2)},aformat=sample_rates=48000:channel_layouts=stereo,apad=whole_dur=${clipDuration.toFixed(3)},atrim=duration=${clipDuration.toFixed(3)}[vo]`
+            );
+            filterParts.push(
+              `[bg][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
+            );
+          } else {
+            const bgFilters: string[] = [];
+            const tempo = 1 / speedRatio;
+            if (sourceInfo.hasAudio && tempo >= 0.5 && tempo <= 2.0) {
+              bgFilters.push(`atempo=${tempo.toFixed(4)}`);
+            }
+            const videoOnlyVol = clampedBgVol <= 0 ? 0 : Math.max(0.85, clampedBgVol);
+            bgFilters.push(
+              `volume=${videoOnlyVol.toFixed(2)}`,
+              'aformat=sample_rates=48000:channel_layouts=stereo',
+              `apad=whole_dur=${clipDuration.toFixed(3)}`,
+              `atrim=duration=${clipDuration.toFixed(3)}`
+            );
+            filterParts.push(`${bgSourceRef}${bgFilters.join(',')}[aout]`);
+          }
+
           args.push(
-            '-f',
-            'lavfi',
+            '-filter_complex',
+            filterParts.join(';'),
+            '-map',
+            '[vout]',
+            '-map',
+            '[aout]',
             '-t',
             clipDuration.toFixed(3),
-            '-i',
-            'anullsrc=channel_layout=stereo:sample_rate=48000'
+            '-c:v',
+            'libx264',
+            '-preset',
+            'veryfast',
+            '-crf',
+            '21',
+            '-pix_fmt',
+            'yuv420p',
+            '-c:a',
+            'aac',
+            '-b:a',
+            '192k',
+            segOutPath
           );
+
+          await execFileAsync('ffmpeg', args);
+          segmentPaths.push(segOutPath);
+
+          subtitleTimings.push({
+            start: cumulativeTime,
+            end: cumulativeTime + clipDuration - 0.08,
+            burmese: clip.burmeseScript.trim(),
+          });
+
+          cumulativeTime += clipDuration;
         }
 
-        const voInputIndex = sourceInfo.hasAudio ? 1 : 2;
-        if (localAudioPath) {
-          args.push('-i', localAudioPath);
-        }
-
-        const clampedBgVol = Math.max(0, Math.min(1, Number(sourceAudioVolume)));
-        const clampedVoVol = Math.max(0, Math.min(2, Number(voiceoverVolume)));
-
-        const filterParts: string[] = [
-          `[0:v]${videoFilters.join(',')}[vout]`,
-        ];
-
-        const bgSourceRef = sourceInfo.hasAudio ? '[0:a]' : '[1:a]';
-
-        if (localAudioPath) {
-          const bgFilters: string[] = [];
-          const tempo = 1 / speedRatio;
-          if (sourceInfo.hasAudio && tempo >= 0.5 && tempo <= 2.0) {
-            bgFilters.push(`atempo=${tempo.toFixed(4)}`);
-          }
-          bgFilters.push(
-            `volume=${clampedBgVol.toFixed(2)}`,
-            'aformat=sample_rates=48000:channel_layouts=stereo',
-            `apad=whole_dur=${clipDuration.toFixed(3)}`,
-            `atrim=duration=${clipDuration.toFixed(3)}`
-          );
-
-          filterParts.push(`${bgSourceRef}${bgFilters.join(',')}[bg]`);
-          filterParts.push(
-            `[${voInputIndex}:a]volume=${clampedVoVol.toFixed(2)},aformat=sample_rates=48000:channel_layouts=stereo,apad=whole_dur=${clipDuration.toFixed(3)},atrim=duration=${clipDuration.toFixed(3)}[vo]`
-          );
-          filterParts.push(
-            `[bg][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
-          );
-        } else {
-          const bgFilters: string[] = [];
-          const tempo = 1 / speedRatio;
-          if (sourceInfo.hasAudio && tempo >= 0.5 && tempo <= 2.0) {
-            bgFilters.push(`atempo=${tempo.toFixed(4)}`);
-          }
-          const videoOnlyVol = clampedBgVol <= 0 ? 0 : Math.max(0.85, clampedBgVol);
-          bgFilters.push(
-            `volume=${videoOnlyVol.toFixed(2)}`,
-            'aformat=sample_rates=48000:channel_layouts=stereo',
-            `apad=whole_dur=${clipDuration.toFixed(3)}`,
-            `atrim=duration=${clipDuration.toFixed(3)}`
-          );
-          filterParts.push(`${bgSourceRef}${bgFilters.join(',')}[aout]`);
-        }
-
-        args.push(
-          '-filter_complex',
-          filterParts.join(';'),
-          '-map',
-          '[vout]',
-          '-map',
-          '[aout]',
-          '-t',
-          clipDuration.toFixed(3),
-          '-c:v',
-          'libx264',
-          '-preset',
-          'veryfast',
-          '-crf',
-          '21',
-          '-pix_fmt',
-          'yuv420p',
-          '-c:a',
-          'aac',
-          '-b:a',
-          '192k',
-          segOutPath
+        const concatListPath = path.join(tempDir, 'concat.txt');
+        fs.writeFileSync(
+          concatListPath,
+          segmentPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n')
         );
 
-        await execFileAsync('ffmpeg', args);
-        segmentPaths.push(segOutPath);
-
-        subtitleTimings.push({
-          start: cumulativeTime,
-          end: cumulativeTime + clipDuration - 0.08,
-          burmese: clip.burmeseScript.trim(),
-        });
-
-        cumulativeTime += clipDuration;
+        await execFileAsync('ffmpeg', [
+          '-y',
+          '-f',
+          'concat',
+          '-safe',
+          '0',
+          '-i',
+          concatListPath,
+          '-c',
+          'copy',
+          mergedRawPath,
+        ]);
       }
 
-      const concatListPath = path.join(tempDir, 'concat.txt');
-      fs.writeFileSync(
-        concatListPath,
-        segmentPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n')
-      );
-
-      const mergedRawPath = path.join(tempDir, 'merged.mp4');
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-f',
-        'concat',
-        '-safe',
-        '0',
-        '-i',
-        concatListPath,
-        '-c',
-        'copy',
-        mergedRawPath,
-      ]);
-
       const episode = path.basename(sourcePath).match(/(?:part|episode|ep)[_ -]*(\d+)/i)?.[1];
-      const name = episode ? `part${episode}` : `burmese-recap-16x9-${Date.now()}`;
+      const name = fromSrt
+        ? `srt-recap-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`
+        : episode ? `part${episode}` : `burmese-recap-16x9-${Date.now()}`;
       const finalMp4Name = `${name}.mp4`;
       const finalSrtName = `${name}.srt`;
       const projectName = projectNameFromSource(sourcePath);

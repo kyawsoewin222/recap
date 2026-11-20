@@ -35,6 +35,8 @@ interface ScriptPanelProps {
   generationProgressText: string | null;
   onTranslateClip: (clip: RecapClip) => Promise<void>;
   translatingClipId: number | null;
+  fromSrt: boolean;
+  busy: boolean;
 }
 
 function formatSourceRange(start: number, end: number): string {
@@ -60,6 +62,8 @@ export default function ScriptPanel({
   generationProgressText,
   onTranslateClip,
   translatingClipId,
+  fromSrt,
+  busy,
 }: ScriptPanelProps) {
   const [copiedBurmese, setCopiedBurmese] = useState(false);
   const [previewPlayingId, setPreviewPlayingId] = useState<number | null>(null);
@@ -99,7 +103,7 @@ export default function ScriptPanel({
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h2 className="text-base font-semibold text-white">
-              Burmese Recap Script
+              {fromSrt ? 'SRT Narration Script' : 'Burmese Recap Script'}
             </h2>
             <p className="text-xs text-slate-400 font-mono tabular-nums mt-0.5">
               {clips.length} clips · {readyAudioCount}/{clips.length} Burmese
@@ -128,7 +132,7 @@ export default function ScriptPanel({
 
         {/* Voice selector + Generate All */}
         <div className="flex flex-wrap items-center gap-2.5">
-          <select
+          {!fromSrt && <select
             aria-label="Select AI Narrator Voice"
             value={selectedVoice}
             onChange={(e) => onVoiceChange(e.target.value)}
@@ -139,12 +143,12 @@ export default function ScriptPanel({
                 {v.label}
               </option>
             ))}
-          </select>
+          </select>}
 
           <button
             type="button"
             onClick={onGenerateAllAudio}
-            disabled={isGeneratingAll}
+            disabled={busy}
             className="h-10 px-4 inline-flex items-center justify-center gap-2 rounded-lg bg-slate-100 hover:bg-white text-slate-950 disabled:opacity-60 text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
           >
             {isGeneratingAll ? (
@@ -233,7 +237,7 @@ export default function ScriptPanel({
                   <button
                     type="button"
                     onClick={() => onGenerateClipAudio(clip)}
-                    disabled={isGeneratingThis || isGeneratingAll}
+                    disabled={busy}
                     className="h-8 px-2.5 inline-flex items-center gap-1 rounded-md border border-slate-700/80 bg-[#0B0F17] hover:bg-slate-800 disabled:opacity-50 text-[11px] font-medium text-slate-200 whitespace-nowrap"
                   >
                     {isGeneratingThis ? (
@@ -252,6 +256,7 @@ export default function ScriptPanel({
                   lang="my"
                   rows={3}
                   value={clip.burmeseScript}
+                  disabled={fromSrt && busy}
                   onChange={(e) =>
                     onUpdateClip(clip.id, { burmeseScript: e.target.value })
                   }
@@ -265,14 +270,14 @@ export default function ScriptPanel({
                 onClick={(e) => e.stopPropagation()}
                 className="flex flex-col gap-1.5"
               >
-                <div className="flex items-start justify-between gap-2">
+                {!fromSrt && <div className="flex items-start justify-between gap-2">
                   <p className="text-xs leading-relaxed text-slate-400">
                     {clip.englishScript}
                   </p>
                   <button
                     type="button"
                     onClick={() => onTranslateClip(clip)}
-                    disabled={isTranslatingThis}
+                    disabled={busy}
                     title="Re-translate English to Burmese via Gemini"
                     className="h-7 px-2 inline-flex items-center gap-1 rounded border border-slate-800 bg-[#0B0F17] hover:bg-slate-800 text-[11px] text-slate-400 hover:text-slate-200 shrink-0 whitespace-nowrap"
                   >
@@ -283,7 +288,7 @@ export default function ScriptPanel({
                     )}
                     <span>Refresh MY</span>
                   </button>
-                </div>
+                </div>}
                 {audioState.status === 'error' && audioState.error && (
                   <p className="text-xs text-rose-400">{audioState.error}</p>
                 )}

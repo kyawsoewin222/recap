@@ -37,6 +37,8 @@ interface RecapPlayerProps {
   isRendering: boolean;
   renderError: string | null;
   onTriggerRender: () => void;
+  fromSrt: boolean;
+  exportDisabled: boolean;
 }
 
 function formatClock(sec: number): string {
@@ -64,6 +66,8 @@ export default function RecapPlayer({
   isRendering,
   renderError,
   onTriggerRender,
+  fromSrt,
+  exportDisabled,
 }: RecapPlayerProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -75,6 +79,7 @@ export default function RecapPlayer({
   const activeAudio = audioMap[activeClip.id];
 
   const getClipEffectiveDuration = (clip: RecapClip) => {
+    if (fromSrt) return clip.targetDuration;
     const audioDur = audioMap[clip.id]?.durationSec;
     if (audioDur && audioDur > 0) {
       return Math.max(2.5, Math.min(14, audioDur + 0.25));
@@ -82,12 +87,12 @@ export default function RecapPlayer({
     return clip.targetDuration;
   };
 
-  const totalRecapDuration = clips.reduce(
+  const totalRecapDuration = fromSrt ? clips[clips.length - 1].sourceEnd : clips.reduce(
     (sum, c) => sum + getClipEffectiveDuration(c),
     0
   );
 
-  const elapsedBeforeActive = clips
+  const elapsedBeforeActive = fromSrt ? activeClip.sourceStart : clips
     .slice(0, activeClipIndex)
     .reduce((sum, c) => sum + getClipEffectiveDuration(c), 0);
 
@@ -105,7 +110,7 @@ export default function RecapPlayer({
     const clip = clips[activeClipIndex];
     if (!clip) return;
 
-    const rawDur = Math.max(1, clip.sourceEnd - clip.sourceStart);
+    const rawDur = fromSrt ? clip.targetDuration : Math.max(1, clip.sourceEnd - clip.sourceStart);
     const targetDur = getClipEffectiveDuration(clip);
     const rate = Math.max(0.6, Math.min(1.75, rawDur / targetDur));
 
@@ -120,6 +125,9 @@ export default function RecapPlayer({
       if (url) {
         voiceEl.src = url;
         voiceEl.currentTime = 0;
+        voiceEl.playbackRate = fromSrt
+          ? Math.max(1, Math.min(4, (audioMap[clip.id]?.durationSec ?? 0) / clip.targetDuration))
+          : 1;
         voiceEl.volume = isMuted ? 0 : 1;
       } else {
         voiceEl.removeAttribute('src');
@@ -160,7 +168,7 @@ export default function RecapPlayer({
       ) {
         video.currentTime = activeClip.sourceStart;
       }
-      const rawDur = Math.max(1, activeClip.sourceEnd - activeClip.sourceStart);
+      const rawDur = fromSrt ? activeClip.targetDuration : Math.max(1, activeClip.sourceEnd - activeClip.sourceStart);
       const targetDur = getClipEffectiveDuration(activeClip);
       video.playbackRate = Math.max(0.6, Math.min(1.75, rawDur / targetDur));
       video.play().catch(() => {});
@@ -168,6 +176,10 @@ export default function RecapPlayer({
       if (voiceEl && activeAudio?.audioUrl) {
         if (!voiceEl.src.endsWith(activeAudio.audioUrl)) {
           voiceEl.src = activeAudio.audioUrl;
+        }
+        if (fromSrt) {
+          voiceEl.playbackRate = Math.max(1, Math.min(4, (activeAudio.durationSec ?? 0) / activeClip.targetDuration));
+          voiceEl.currentTime = Math.max(0, video.currentTime - activeClip.sourceStart) * voiceEl.playbackRate;
         }
         voiceEl.play().catch(() => {});
       }
@@ -183,7 +195,7 @@ export default function RecapPlayer({
     const video = videoRef.current;
     if (!video) return;
 
-    const span = Math.max(0.5, activeClip.sourceEnd - activeClip.sourceStart);
+    const span = fromSrt ? activeClip.targetDuration : Math.max(0.5, activeClip.sourceEnd - activeClip.sourceStart);
     const progress = Math.max(
       0,
       Math.min(1, (video.currentTime - activeClip.sourceStart) / span)
@@ -191,7 +203,7 @@ export default function RecapPlayer({
     setClipProgress(progress);
 
     if (isPlaying && video.currentTime >= activeClip.sourceEnd - 0.06) {
-      if (activeClipIndex < clips.length - 1) {
+      if (!fromSrt && activeClipIndex < clips.length - 1) {
         onSelectClip(activeClipIndex + 1);
       } else {
         setIsPlaying(false);
@@ -296,11 +308,11 @@ export default function RecapPlayer({
               <div className="pointer-events-none absolute inset-x-0 bottom-3 md:bottom-4 px-5 md:px-10 flex flex-col items-center text-center gap-1.5">
                 <p
                   lang="my"
-                  className="font-myanmar text-sm sm:text-base md:text-[18px] font-semibold leading-relaxed text-white drop-shadow-[0_2px_6px_rgba(0,0,0,0.95)] bg-black/60 px-3.5 py-1.5 rounded-md max-w-3xl"
+                  className="font-myanmar whitespace-pre-line text-sm sm:text-base md:text-[18px] font-semibold leading-relaxed text-white drop-shadow-[0_2px_6px_rgba(0,0,0,0.95)] bg-black/60 px-3.5 py-1.5 rounded-md max-w-3xl"
                 >
                   {activeClip.burmeseScript}
                 </p>
-                {subtitleMode === 'bilingual' && (
+                {subtitleMode === 'bilingual' && !fromSrt && (
                   <p className="text-[11px] sm:text-xs font-medium text-slate-200 bg-black/55 px-2.5 py-0.5 rounded max-w-2xl">
                     {activeClip.englishScript}
                   </p>
@@ -350,7 +362,7 @@ export default function RecapPlayer({
                 ) : (
                   <>
                     <Play className="w-4 h-4" />
-                    <span>Play Recap</span>
+                    <span>{fromSrt ? 'Play Cue' : 'Play Recap'}</span>
                   </>
                 )}
               </button>
@@ -415,7 +427,7 @@ export default function RecapPlayer({
           {/* Segmented Timeline */}
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between text-xs text-slate-400">
-              <span>{clips.length}-Segment Condensed Timeline</span>
+              <span>{fromSrt ? `${clips.length} Narration Cues` : `${clips.length}-Segment Condensed Timeline`}</span>
               <span className="font-mono tabular-nums">
                 Clip {String(activeClipIndex + 1).padStart(2, '0')} of{' '}
                 {clips.length}
@@ -464,13 +476,13 @@ export default function RecapPlayer({
                     { key: 'bilingual', label: 'Burmese + EN' },
                     { key: 'off', label: 'Off' },
                   ] as const
-                ).map((opt) => (
+                ).filter((opt) => !fromSrt || opt.key !== 'bilingual').map((opt) => (
                   <button
                     key={opt.key}
                     type="button"
                     onClick={() => onSubtitleModeChange(opt.key)}
                     className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                      subtitleMode === opt.key
+                      (fromSrt && subtitleMode === 'bilingual' ? 'burmese' : subtitleMode) === opt.key
                         ? 'bg-slate-800 text-white'
                         : 'text-slate-400 hover:text-slate-200'
                     }`}
@@ -589,7 +601,7 @@ export default function RecapPlayer({
           <button
             type="button"
             onClick={onTriggerRender}
-            disabled={isRendering}
+            disabled={exportDisabled}
             className="h-10 px-4 inline-flex items-center gap-2 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-60 text-xs font-semibold text-white transition-colors whitespace-nowrap shrink-0"
           >
             <span>
