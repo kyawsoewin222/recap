@@ -26,10 +26,11 @@ class EdgeTTSRequest(BaseModel):
     clip_id: int
     text: str
     voice_name: str = "my-MM-ThihaNeural"  # or "my-MM-NilarNeural"
-    rate: str = "+12%"
+    rate: str = "+0%"
 
 
 class RenderRequest(BaseModel):
+    video_only: bool = False
     source_video_path: str
     clips: list[RecapClip]
     job_id: Optional[str] = None

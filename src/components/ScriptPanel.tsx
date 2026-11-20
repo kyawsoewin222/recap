@@ -7,7 +7,7 @@ import {
   Play,
   Volume2,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ClipAudioState, RecapClip } from '../data/recapClips';
 
 const VOICE_OPTIONS = [
@@ -27,7 +27,7 @@ interface ScriptPanelProps {
   onSelectClip: (index: number) => void;
   onUpdateClip: (
     clipId: number,
-    patch: Partial<Pick<RecapClip, 'burmeseScript' | 'englishScript'>>
+    patch: Partial<Pick<RecapClip, 'burmeseScript' | 'englishScript' | 'sourceStart' | 'sourceEnd'>>
   ) => void;
   onGenerateClipAudio: (clip: RecapClip) => Promise<void>;
   onGenerateAllAudio: () => Promise<void>;
@@ -35,6 +35,8 @@ interface ScriptPanelProps {
   generationProgressText: string | null;
   onTranslateClip: (clip: RecapClip) => Promise<void>;
   translatingClipId: number | null;
+  fromSrt: boolean;
+  busy: boolean;
 }
 
 function formatSourceRange(start: number, end: number): string {
@@ -60,9 +62,26 @@ export default function ScriptPanel({
   generationProgressText,
   onTranslateClip,
   translatingClipId,
+  fromSrt,
+  busy,
 }: ScriptPanelProps) {
   const [copiedBurmese, setCopiedBurmese] = useState(false);
   const [previewPlayingId, setPreviewPlayingId] = useState<number | null>(null);
+  const previewAudio = useRef<{ audio: HTMLAudioElement; clipId: number; url: string } | null>(null);
+
+  useEffect(() => {
+    const preview = previewAudio.current;
+    if (preview && (audioMap[preview.clipId]?.audioUrl !== preview.url || audioMap[preview.clipId]?.status !== 'ready')) {
+      preview.audio.pause();
+      previewAudio.current = null;
+      setPreviewPlayingId(null);
+    }
+  }, [audioMap]);
+
+  useEffect(() => () => {
+    previewAudio.current?.audio.pause();
+    previewAudio.current = null;
+  }, []);
 
   const readyAudioCount = clips.filter(
     (c) => audioMap[c.id]?.status === 'ready'
@@ -81,11 +100,19 @@ export default function ScriptPanel({
   };
 
   const handlePlaySingleAudio = (clipId: number, url: string) => {
+    previewAudio.current?.audio.pause();
     const audio = new Audio(url);
+    previewAudio.current = { audio, clipId, url };
     setPreviewPlayingId(clipId);
-    audio.onended = () => setPreviewPlayingId(null);
-    audio.onerror = () => setPreviewPlayingId(null);
-    audio.play().catch(() => setPreviewPlayingId(null));
+    const finish = () => {
+      if (previewAudio.current?.audio === audio) {
+        previewAudio.current = null;
+        setPreviewPlayingId(null);
+      }
+    };
+    audio.onended = finish;
+    audio.onerror = finish;
+    audio.play().catch(finish);
   };
 
   return (
@@ -99,7 +126,7 @@ export default function ScriptPanel({
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h2 className="text-base font-semibold text-white">
-              Burmese Recap Script
+              {fromSrt ? 'SRT Narration Script' : 'Burmese Recap Script'}
             </h2>
             <p className="text-xs text-slate-400 font-mono tabular-nums mt-0.5">
               {clips.length} clips · {readyAudioCount}/{clips.length} Burmese
@@ -128,7 +155,7 @@ export default function ScriptPanel({
 
         {/* Voice selector + Generate All */}
         <div className="flex flex-wrap items-center gap-2.5">
-          <select
+          {!fromSrt && <select
             aria-label="Select AI Narrator Voice"
             value={selectedVoice}
             onChange={(e) => onVoiceChange(e.target.value)}
@@ -139,12 +166,12 @@ export default function ScriptPanel({
                 {v.label}
               </option>
             ))}
-          </select>
+          </select>}
 
           <button
             type="button"
             onClick={onGenerateAllAudio}
-            disabled={isGeneratingAll}
+            disabled={busy}
             className="h-10 px-4 inline-flex items-center justify-center gap-2 rounded-lg bg-slate-100 hover:bg-white text-slate-950 disabled:opacity-60 text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
           >
             {isGeneratingAll ? (
@@ -233,7 +260,7 @@ export default function ScriptPanel({
                   <button
                     type="button"
                     onClick={() => onGenerateClipAudio(clip)}
-                    disabled={isGeneratingThis || isGeneratingAll}
+                    disabled={busy}
                     className="h-8 px-2.5 inline-flex items-center gap-1 rounded-md border border-slate-700/80 bg-[#0B0F17] hover:bg-slate-800 disabled:opacity-50 text-[11px] font-medium text-slate-200 whitespace-nowrap"
                   >
                     {isGeneratingThis ? (
@@ -246,12 +273,27 @@ export default function ScriptPanel({
                 </div>
               </div>
 
+              <div className="flex gap-3 text-xs text-slate-400" onClick={(event) => event.stopPropagation()}>
+                {(['sourceStart', 'sourceEnd'] as const).map((field) => (
+                  <label key={`${clip.id}-${field}-${clip[field]}`} className="flex items-center gap-2">
+                    {field === 'sourceStart' ? 'Source start (s)' : 'Source end (s)'}
+                    <input type="number" min={0} step={0.1} defaultValue={clip[field]} disabled={busy}
+                      className="w-20 rounded bg-slate-900 p-1 text-slate-100" aria-label={`${field} for ${clip.title}`}
+                      onBlur={(event) => {
+                        if (event.target.value !== '' && Number(event.target.value) !== clip[field]) {
+                          onUpdateClip(clip.id, { [field]: Number(event.target.value) });
+                        }
+                      }} />
+                  </label>
+                ))}
+              </div>
               {/* Editable Burmese narration */}
               <div onClick={(e) => e.stopPropagation()}>
                 <textarea
                   lang="my"
                   rows={3}
                   value={clip.burmeseScript}
+                  disabled={fromSrt && busy}
                   onChange={(e) =>
                     onUpdateClip(clip.id, { burmeseScript: e.target.value })
                   }
@@ -265,14 +307,14 @@ export default function ScriptPanel({
                 onClick={(e) => e.stopPropagation()}
                 className="flex flex-col gap-1.5"
               >
-                <div className="flex items-start justify-between gap-2">
+                {!fromSrt && <div className="flex items-start justify-between gap-2">
                   <p className="text-xs leading-relaxed text-slate-400">
                     {clip.englishScript}
                   </p>
                   <button
                     type="button"
                     onClick={() => onTranslateClip(clip)}
-                    disabled={isTranslatingThis}
+                    disabled={busy}
                     title="Re-translate English to Burmese via Gemini"
                     className="h-7 px-2 inline-flex items-center gap-1 rounded border border-slate-800 bg-[#0B0F17] hover:bg-slate-800 text-[11px] text-slate-400 hover:text-slate-200 shrink-0 whitespace-nowrap"
                   >
@@ -283,7 +325,7 @@ export default function ScriptPanel({
                     )}
                     <span>Refresh MY</span>
                   </button>
-                </div>
+                </div>}
                 {audioState.status === 'error' && audioState.error && (
                   <p className="text-xs text-rose-400">{audioState.error}</p>
                 )}

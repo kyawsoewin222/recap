@@ -86,6 +86,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         original_audio_volume=args.orig_vol,
         voiceover_volume=args.vo_vol,
         auto_duck_original_audio=not args.no_duck,
+        video_only=args.video_only,
     )
 
     print("\n=== DONE ===")
@@ -106,7 +107,7 @@ def main() -> None:
     parser.add_argument("--full-res-upload", action="store_true")
     parser.add_argument("--strip-audio", action="store_true", help="Strip audio from Gemini upload proxy to save ~50% tokens")
     parser.add_argument("--voice", default="my-MM-ThihaNeural", choices=["my-MM-ThihaNeural", "my-MM-NilarNeural"])
-    parser.add_argument("--rate", default="+12%")
+    parser.add_argument("--rate", default="+0%")
     parser.add_argument("--video-only", action="store_true", help="Skip TTS and export video + original audio + script only")
     parser.add_argument("--orig-vol", type=float, default=0.35, help="Original video audio volume (0.0 - 1.5)")
     parser.add_argument("--vo-vol", type=float, default=1.15, help="Edge TTS voiceover volume")

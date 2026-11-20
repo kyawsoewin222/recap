@@ -6,3 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Generated recap media and Python caches
+public/tts/
+public/uploads/
+public/renders/
+storage/
+__pycache__/
+*.pyc

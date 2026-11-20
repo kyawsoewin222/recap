@@ -8,6 +8,9 @@ import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
 import { createServer as createViteServer } from 'vite';
+import { parseSrt } from './src/data/srt.ts';
+import { getSegmentTiming } from './src/data/timing.ts';
+import { alignedSubtitleCues } from './src/data/alignment.ts';
 
 dotenv.config();
 
@@ -60,7 +63,18 @@ async function probeDuration(filePath: string): Promise<number> {
     filePath,
   ]);
   const parsed = parseFloat(stdout.trim());
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 8.5;
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error('Could not measure media duration. Regenerate narration and retry.');
+  return parsed;
+}
+
+function narrationCues(audioPath: string, text: string, duration: number) {
+  const metadataPath = audioPath.replace(/\.[^.]+$/, '.json');
+  if (fs.existsSync(metadataPath)) {
+    const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+    if (metadata.text !== text.trim()) throw new Error('Narration changed. Regenerate its audio.');
+    return alignedSubtitleCues(text.trim(), duration, metadata.boundaries);
+  }
+  return alignedSubtitleCues(text.trim(), duration);
 }
 
 async function probeVideoInfo(filePath: string): Promise<{
@@ -144,11 +158,11 @@ function formatAssTime(seconds: number): string {
 }
 
 function formatSrtTime(seconds: number): string {
-  const clamped = Math.max(0, seconds);
-  const h = Math.floor(clamped / 3600);
-  const m = Math.floor((clamped % 3600) / 60);
-  const s = Math.floor(clamped % 60);
-  const ms = Math.floor((clamped - Math.floor(clamped)) * 1000);
+  const clamped = Math.round(Math.max(0, seconds) * 1000);
+  const h = Math.floor(clamped / 3600000);
+  const m = Math.floor((clamped % 3600000) / 60000);
+  const s = Math.floor((clamped % 60000) / 1000);
+  const ms = clamped % 1000;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
 }
 
@@ -366,7 +380,7 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
 
       const hash = crypto
         .createHash('sha1')
-        .update(`${selectedVoice}:${text.trim()}`)
+        .update(`natural-v2:${selectedVoice}:${text.trim()}`)
         .digest('hex')
         .slice(0, 12);
       const fileName = `clip-${clipId}-${hash}.wav`;
@@ -389,7 +403,7 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
                 text: text.trim(),
                 speechMetadata: {
                   style:
-                    'Fast-paced, energetic, clear Burmese YouTube movie recap narrator',
+                    'Natural, consistent Burmese speaking pace. Speak clearly and preserve every word; do not rush.',
                 },
               },
             ],
@@ -416,7 +430,22 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
       }
 
       const wavBuffer = Buffer.from(base64Audio, 'base64');
-      fs.writeFileSync(outPath, wavBuffer);
+      const temporary = `${outPath}.${crypto.randomBytes(6).toString('hex')}.pcm`;
+      try {
+        if (wavBuffer.subarray(0, 4).toString() === 'RIFF') {
+          fs.writeFileSync(outPath, wavBuffer);
+        } else {
+          // Gemini returns raw 24 kHz PCM; a .wav extension alone does not add a header.
+          fs.writeFileSync(temporary, wavBuffer);
+          await execFileAsync('ffmpeg', ['-v', 'error', '-y', '-f', 's16le', '-ar', '24000', '-ac', '1', '-i', temporary, outPath]);
+        }
+        await probeDuration(outPath);
+      } catch (error) {
+        fs.rmSync(outPath, { force: true });
+        throw error;
+      } finally {
+        fs.rmSync(temporary, { force: true });
+      }
       const durationSec = await probeDuration(outPath);
 
       res.json({ audioUrl: `/tts/${fileName}`, durationSec, cached: false });
@@ -533,15 +562,15 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
         }
 
         try {
-          const prompt = `Analyze this ${chunk.durationSec.toFixed(1)}-second video clip and create a fast-paced YouTube movie recap storyboard split into short micro-segments.
+          const prompt = `Analyze this ${chunk.durationSec.toFixed(1)}-second video clip and create a chronological YouTube movie recap storyboard with natural Burmese narration.
 
 Rules:
 1. Do NOT copy or translate spoken/subtitle dialogue word-for-word. Describe all events using original recap narration wording for copyright safety.
-2. Cover the whole key plot chronologically. Each segment must be 1 short punchy sentence (about 3.0 to 5.2 seconds when spoken).
-3. For a 3-minute episode, produce ~20-26 segments; scale proportionally for longer/shorter chunks.
+2. Cover the whole key plot chronologically. Remove repetition only. Preserve identities, actions, motivations, cause and effect, outcomes, important dialogue meaning, and reveals. Do not invent facts or change chronology. Compare narration against the source context before returning it.
+3. Prefer concise segments, but retain essential meaning even when a segment must be longer.
 4. Provide accurate sourceStart and sourceEnd in seconds relative to THIS video clip (0 to ${chunk.durationSec.toFixed(1)}), with sourceEnd > sourceStart + 1.2.
-5. Set targetDuration between 3.0 and 5.5 seconds matching the Burmese sentence length.
-6. Write natural, dramatic, fast-paced spoken Burmese (Myanmar Unicode) in burmeseScript, plus concise English summary in englishScript and a short 2-3 word title.`;
+5. Set targetDuration as an estimate at a natural speaking pace; short durations are preferences, never hard caps. Select enough relevant footage to fit narration at 0.85x–1.15x video playback. Do not borrow unrelated scenes.
+6. Write natural, clear spoken Burmese (Myanmar Unicode) in burmeseScript, plus concise English summary in englishScript and a short 2-3 word title.`;
 
           const response = await withGeminiRetry(() =>
             ai.models.generateContent({
@@ -601,7 +630,7 @@ Rules:
           for (const item of parsed) {
             const relStart = Math.max(0, Math.min(chunk.durationSec - 1.5, Number(item.sourceStart) || 0));
             const relEnd = Math.max(relStart + 1.2, Math.min(chunk.durationSec, Number(item.sourceEnd) || relStart + 4));
-            const targetDur = Math.max(2.5, Math.min(6.0, Number(item.targetDuration) || 4.2));
+            const targetDur = Math.max(1, Number(item.targetDuration) || relEnd - relStart);
             allClips.push({
               id: nextId,
               title: `${String(nextId).padStart(2, '0')}. ${(item.title || `Scene ${nextId}`).replace(/^\d+\.\s*/, '')}`,
@@ -636,6 +665,59 @@ Rules:
     }
   });
 
+  app.post('/api/import-srt', async (req, res) => {
+    const { sourceVideoUrl, srt } = req.body;
+    if (typeof srt !== 'string' || Buffer.byteLength(srt) > 1024 * 1024) {
+      res.status(400).json({ error: 'Choose an SRT file of 1 MB or less.' });
+      return;
+    }
+    try {
+      const sourcePath = resolveSourceVideoPath(sourceVideoUrl);
+      if (!fs.existsSync(sourcePath)) {
+        res.status(404).json({ error: 'Upload a matching source video before importing the SRT.' });
+        return;
+      }
+      const { durationSec } = await probeVideoInfo(sourcePath);
+      if (durationSec <= 0) throw new Error('Could not read the source video duration.');
+      res.json({ clips: parseSrt(srt, durationSec) });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Could not import SRT.' });
+    }
+  });
+
+  app.post('/api/srt-tts', async (req, res) => {
+    const { clipId, text, voiceName } = req.body;
+    if (!Number.isSafeInteger(clipId) || clipId < 1 || typeof text !== 'string' ||
+        !text.trim() || !['my-MM-ThihaNeural', 'my-MM-NilarNeural'].includes(voiceName)) {
+      res.status(400).json({ error: 'A cue number, narration text, and Burmese voice are required.' });
+      return;
+    }
+    try {
+      const python = process.env.EDGE_TTS_PYTHON || 'python3';
+      const script = path.join(ROOT_DIR, 'python_pipeline', 'edge_tts_service.py');
+      const job = execFileAsync(python, [script, String(clipId), voiceName, TTS_DIR], {
+        timeout: 120_000,
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      });
+      job.child.stdin?.on('error', () => {});
+      job.child.stdin?.end(text, 'utf8');
+      const { stdout } = await job;
+      const name = stdout.trim();
+      if (!/^clip-\d+-[a-f0-9]{12}\.mp3$/.test(name)) throw new Error('Unexpected narration output.');
+      const audioPath = path.join(TTS_DIR, name);
+      const durationSec = await probeDuration(audioPath);
+      res.json({ audioUrl: `/tts/${name}`, durationSec, ...narrationCues(audioPath, text, durationSec) });
+    } catch (err) {
+      console.error('SRT narration failed:', err);
+      const missing = err instanceof Error && /No module named 'edge_tts'|ENOENT/.test(err.message);
+      res.status(502).json({
+        error: missing
+          ? 'Edge TTS is unavailable. Install edge-tts in the Python environment used by the server.'
+          : 'Edge TTS could not generate this cue. Check the connection and try again.',
+      });
+    }
+  });
+
   app.post('/api/render', async (req, res) => {
     const tempDir = path.join(
       RENDERS_DIR,
@@ -650,6 +732,8 @@ Rules:
         maskBottomSubtitles = true,
         sourceAudioVolume = 0.14,
         voiceoverVolume = 1.0,
+        scriptSource = 'gemini',
+        sample = false,
       } = req.body as {
         clips: RenderClipInput[];
         sourceVideoUrl?: string;
@@ -657,7 +741,10 @@ Rules:
         maskBottomSubtitles?: boolean;
         sourceAudioVolume?: number;
         voiceoverVolume?: number;
+        scriptSource?: 'gemini' | 'srt';
+        sample?: boolean;
       };
+      const fromSrt = scriptSource === 'srt';
 
       const sourcePath = resolveSourceVideoPath(sourceVideoUrl);
       if (!fs.existsSync(sourcePath)) {
@@ -671,184 +758,194 @@ Rules:
         res.status(400).json({ error: 'At least one recap clip is required.' });
         return;
       }
-
-      fs.mkdirSync(tempDir, { recursive: true });
-
-      const segmentPaths: string[] = [];
-      const subtitleTimings: Array<{
-        start: number;
-        end: number;
-        burmese: string;
-      }> = [];
-
-      let cumulativeTime = 0;
-
-      for (let i = 0; i < clips.length; i++) {
-        const clip = clips[i];
-        const srcStart = Math.max(0, Number(clip.sourceStart));
-        const srcEnd = Math.max(srcStart + 1, Number(clip.sourceEnd));
-        const rawSrcDur = srcEnd - srcStart;
-
-        let localAudioPath: string | null = null;
-        let clipDuration = Math.max(2.5, Number(clip.targetDuration) || 4.5);
-
-        if (clip.audioUrl && clip.audioUrl.startsWith('/tts/')) {
-          const candidate = path.join(TTS_DIR, path.basename(clip.audioUrl));
-          if (fs.existsSync(candidate)) {
-            localAudioPath = candidate;
-            const ttsDur = await probeDuration(candidate);
-            clipDuration = Math.max(2.5, Math.min(14, ttsDur + 0.25));
-          }
-        }
-
-        const speedRatio = clipDuration / rawSrcDur;
-        const segOutPath = path.join(
-          tempDir,
-          `seg-${String(i).padStart(2, '0')}.mp4`
-        );
-
-        const videoFilters = [
-          'scale=1280:720:force_original_aspect_ratio=increase',
-          'crop=1280:720',
-          'fps=25',
-          `setpts=${speedRatio.toFixed(6)}*PTS`,
-        ];
-
-        if (maskBottomSubtitles) {
-          videoFilters.push(
-            'drawbox=x=0:y=592:w=1280:h=128:color=black@0.82:t=fill'
-          );
-        }
-
-        const args: string[] = [
-          '-y',
-          '-ss',
-          srcStart.toFixed(3),
-          '-t',
-          rawSrcDur.toFixed(3),
-          '-i',
-          sourcePath,
-        ];
-
-        if (!sourceInfo.hasAudio) {
-          args.push(
-            '-f',
-            'lavfi',
-            '-t',
-            clipDuration.toFixed(3),
-            '-i',
-            'anullsrc=channel_layout=stereo:sample_rate=48000'
-          );
-        }
-
-        const voInputIndex = sourceInfo.hasAudio ? 1 : 2;
-        if (localAudioPath) {
-          args.push('-i', localAudioPath);
-        }
-
-        const clampedBgVol = Math.max(0, Math.min(1, Number(sourceAudioVolume)));
-        const clampedVoVol = Math.max(0, Math.min(2, Number(voiceoverVolume)));
-
-        const filterParts: string[] = [
-          `[0:v]${videoFilters.join(',')}[vout]`,
-        ];
-
-        const bgSourceRef = sourceInfo.hasAudio ? '[0:a]' : '[1:a]';
-
-        if (localAudioPath) {
-          const bgFilters: string[] = [];
-          const tempo = 1 / speedRatio;
-          if (sourceInfo.hasAudio && tempo >= 0.5 && tempo <= 2.0) {
-            bgFilters.push(`atempo=${tempo.toFixed(4)}`);
-          }
-          bgFilters.push(
-            `volume=${clampedBgVol.toFixed(2)}`,
-            'aformat=sample_rates=48000:channel_layouts=stereo',
-            `apad=whole_dur=${clipDuration.toFixed(3)}`,
-            `atrim=duration=${clipDuration.toFixed(3)}`
-          );
-
-          filterParts.push(`${bgSourceRef}${bgFilters.join(',')}[bg]`);
-          filterParts.push(
-            `[${voInputIndex}:a]volume=${clampedVoVol.toFixed(2)},aformat=sample_rates=48000:channel_layouts=stereo,apad=whole_dur=${clipDuration.toFixed(3)},atrim=duration=${clipDuration.toFixed(3)}[vo]`
-          );
-          filterParts.push(
-            `[bg][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
-          );
-        } else {
-          const bgFilters: string[] = [];
-          const tempo = 1 / speedRatio;
-          if (sourceInfo.hasAudio && tempo >= 0.5 && tempo <= 2.0) {
-            bgFilters.push(`atempo=${tempo.toFixed(4)}`);
-          }
-          const videoOnlyVol = clampedBgVol <= 0 ? 0 : Math.max(0.85, clampedBgVol);
-          bgFilters.push(
-            `volume=${videoOnlyVol.toFixed(2)}`,
-            'aformat=sample_rates=48000:channel_layouts=stereo',
-            `apad=whole_dur=${clipDuration.toFixed(3)}`,
-            `atrim=duration=${clipDuration.toFixed(3)}`
-          );
-          filterParts.push(`${bgSourceRef}${bgFilters.join(',')}[aout]`);
-        }
-
-        args.push(
-          '-filter_complex',
-          filterParts.join(';'),
-          '-map',
-          '[vout]',
-          '-map',
-          '[aout]',
-          '-t',
-          clipDuration.toFixed(3),
-          '-c:v',
-          'libx264',
-          '-preset',
-          'veryfast',
-          '-crf',
-          '21',
-          '-pix_fmt',
-          'yuv420p',
-          '-c:a',
-          'aac',
-          '-b:a',
-          '192k',
-          segOutPath
-        );
-
-        await execFileAsync('ffmpeg', args);
-        segmentPaths.push(segOutPath);
-
-        subtitleTimings.push({
-          start: cumulativeTime,
-          end: cumulativeTime + clipDuration - 0.08,
-          burmese: clip.burmeseScript.trim(),
-        });
-
-        cumulativeTime += clipDuration;
+      const invalid = clips.findIndex((clip, i) =>
+        !clip || !Number.isFinite(clip.sourceStart) || !Number.isFinite(clip.sourceEnd) ||
+        clip.sourceStart < 0 || clip.sourceEnd <= clip.sourceStart ||
+        clip.sourceEnd > sourceInfo.durationSec || typeof clip.burmeseScript !== 'string' ||
+        (i > 0 && clip.sourceStart < clips[i - 1].sourceEnd) ||
+        !clip.burmeseScript.trim() || typeof clip.audioUrl !== 'string' ||
+        !/^\/tts\/clip-\d+-[a-f0-9]{12}\.(mp3|wav)$/.test(clip.audioUrl) ||
+        !fs.existsSync(path.join(TTS_DIR, path.basename(clip.audioUrl))));
+      if (invalid >= 0) {
+        res.status(400).json({ error: `Segment ${invalid + 1} needs a chronological source range and generated narration. Regenerate audio before exporting.` });
+        return;
       }
 
-      const concatListPath = path.join(tempDir, 'concat.txt');
-      fs.writeFileSync(
-        concatListPath,
-        segmentPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n')
-      );
+      for (const clip of clips) {
+        const voices = clip.audioUrl!.endsWith('.mp3')
+          ? ['my-MM-ThihaNeural', 'my-MM-NilarNeural'].map(voice => `${voice}:+0%:${clip.burmeseScript.trim()}`)
+          : ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'].map(voice => `natural-v2:${voice}:${clip.burmeseScript.trim()}`);
+        if (!voices.some(key => clip.audioUrl!.includes(crypto.createHash('sha1').update(key).digest('hex').slice(0, 12)))) {
+          throw new Error(`Segment ${clip.id}: narration changed or audio uses an old speaking style. Regenerate its audio.`);
+        }
+      }
+
+      if (includeSubtitles) {
+        const { stdout } = await execFileAsync('ffmpeg', ['-hide_banner', '-filters']);
+        if (!/\bass\s+V->V/.test(stdout)) {
+          throw new Error('Burned subtitles require an FFmpeg build with libass. Select subtitles Off to export video plus SRT, or configure a libass-enabled FFmpeg.');
+        }
+      }
+      fs.mkdirSync(tempDir, { recursive: true });
 
       const mergedRawPath = path.join(tempDir, 'merged.mp4');
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-f',
-        'concat',
-        '-safe',
-        '0',
-        '-i',
-        concatListPath,
-        '-c',
-        'copy',
-        mergedRawPath,
-      ]);
+      const subtitleTimings: Array<{ start: number; end: number; burmese: string }> = [];
+      let subtitleTiming = 'aligned';
+
+      {
+        const segmentPaths: string[] = [];
+        const segmentDurations: number[] = [];
+
+        let cumulativeTime = 0;
+
+        for (let i = 0; i < clips.length; i++) {
+          const clip = clips[i];
+          const srcStart = clip.sourceStart;
+          const srcEnd = clip.sourceEnd;
+          const rawSrcDur = srcEnd - srcStart;
+
+          const localAudioPath = path.join(TTS_DIR, path.basename(clip.audioUrl!));
+          const ttsDur = await probeDuration(localAudioPath);
+          const { duration: clipDuration, speed } = getSegmentTiming(clip, ttsDur);
+          const speedRatio = 1 / speed;
+          const segOutPath = path.join(
+            tempDir,
+            `seg-${String(i).padStart(2, '0')}.mp4`
+          );
+
+          const videoFilters = [
+            'scale=1280:720:force_original_aspect_ratio=increase',
+            'crop=1280:720',
+            'fps=25',
+            `setpts=${speedRatio.toFixed(6)}*PTS`,
+          ];
+
+          if (maskBottomSubtitles) {
+            videoFilters.push(
+              'drawbox=x=0:y=592:w=1280:h=128:color=black@0.82:t=fill'
+            );
+          }
+
+          const args: string[] = [
+            '-y',
+            '-ss',
+            srcStart.toFixed(3),
+            '-t',
+            rawSrcDur.toFixed(3),
+            '-i',
+            sourcePath,
+          ];
+
+          if (!sourceInfo.hasAudio) {
+            args.push(
+              '-f',
+              'lavfi',
+              '-t',
+              clipDuration.toFixed(3),
+              '-i',
+              'anullsrc=channel_layout=stereo:sample_rate=48000'
+            );
+          }
+
+          const voInputIndex = sourceInfo.hasAudio ? 1 : 2;
+          if (localAudioPath) {
+            args.push('-i', localAudioPath);
+          }
+
+          const clampedBgVol = Math.max(0, Math.min(1, Number(sourceAudioVolume)));
+          const clampedVoVol = Math.max(0, Math.min(2, Number(voiceoverVolume)));
+
+          const filterParts: string[] = [
+            `[0:v]${videoFilters.join(',')}[vout]`,
+          ];
+
+          const bgSourceRef = sourceInfo.hasAudio ? '[0:a]' : '[1:a]';
+
+          if (localAudioPath) {
+            const bgFilters: string[] = [];
+            const tempo = 1 / speedRatio;
+            if (sourceInfo.hasAudio && tempo >= 0.5 && tempo <= 2.0) {
+              bgFilters.push(`atempo=${tempo.toFixed(4)}`);
+            }
+            bgFilters.push(
+              `volume=${clampedBgVol.toFixed(2)}`,
+              'aformat=sample_rates=48000:channel_layouts=stereo',
+              `apad=whole_dur=${clipDuration.toFixed(3)}`,
+              `atrim=duration=${clipDuration.toFixed(3)}`
+            );
+
+            filterParts.push(`${bgSourceRef}${bgFilters.join(',')}[bg]`);
+            filterParts.push(
+              `[${voInputIndex}:a]volume=${clampedVoVol.toFixed(2)},aformat=sample_rates=48000:channel_layouts=stereo,apad=whole_dur=${clipDuration.toFixed(3)},atrim=duration=${clipDuration.toFixed(3)}[vo]`
+            );
+            filterParts.push(
+              `[bg][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
+            );
+          }
+
+          args.push(
+            '-filter_complex',
+            filterParts.join(';'),
+            '-map',
+            '[vout]',
+            '-map',
+            '[aout]',
+            '-t',
+            clipDuration.toFixed(3),
+            '-c:v',
+            'libx264',
+            '-preset',
+            'veryfast',
+            '-crf',
+            '21',
+            '-pix_fmt',
+            'yuv420p',
+            '-c:a',
+            'aac',
+            '-b:a',
+            '192k',
+            segOutPath
+          );
+
+          await execFileAsync('ffmpeg', args);
+          segmentPaths.push(segOutPath);
+          segmentDurations.push(clipDuration);
+
+          const cueData = narrationCues(localAudioPath, clip.burmeseScript, ttsDur);
+          if (cueData.subtitleTiming === 'approximate') subtitleTiming = 'approximate';
+          subtitleTimings.push(...cueData.subtitleCues.map(cue => ({
+            ...cue, start: cumulativeTime + cue.start, end: cumulativeTime + cue.end,
+          })));
+
+          cumulativeTime += clipDuration;
+        }
+
+        const concatListPath = path.join(tempDir, 'concat.txt');
+        fs.writeFileSync(
+          concatListPath,
+          segmentPaths.map((p, i) => `file '${p.replace(/'/g, "'\\''")}'\nduration ${segmentDurations[i].toFixed(6)}`).join('\n')
+        );
+
+        await execFileAsync('ffmpeg', [
+          '-y',
+          '-f',
+          'concat',
+          '-safe',
+          '0',
+          '-i',
+          concatListPath,
+          '-c',
+          'copy',
+          '-t', cumulativeTime.toFixed(3),
+          mergedRawPath,
+        ]);
+      }
 
       const episode = path.basename(sourcePath).match(/(?:part|episode|ep)[_ -]*(\d+)/i)?.[1];
-      const name = episode ? `part${episode}` : `burmese-recap-16x9-${Date.now()}`;
+      const renderName = fromSrt
+        ? `srt-recap-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`
+        : episode ? `part${episode}` : `burmese-recap-16x9-${Date.now()}`;
+      const name = sample ? `${renderName}-sample-${Date.now()}` : renderName;
       const finalMp4Name = `${name}.mp4`;
       const finalSrtName = `${name}.srt`;
       const projectName = projectNameFromSource(sourcePath);
@@ -943,6 +1040,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         fileSizeBytes: stats.size,
         width: 1280,
         height: 720,
+        subtitleTiming,
+        warning: subtitleTiming === 'approximate' ? 'Subtitle phrases use approximate timing, not speech alignment. Review the sample before processing the full project.' : 'Subtitles use provider speech boundaries. Review the sample before processing the full project.',
       });
     } catch (err: unknown) {
       const message =
