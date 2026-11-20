@@ -8,8 +8,8 @@ import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
 import { createServer as createViteServer } from 'vite';
-import { parseSrt } from './src/data/srt.ts';
-import { getSegmentTiming } from './src/data/timing.ts';
+import { buildSrtFromClips, parseSrt } from './src/data/srt.ts';
+import { estimateBurmeseSpeechSec, getSegmentTiming, wrapBurmeseCueLines } from './src/data/timing.ts';
 import { alignedSubtitleCues } from './src/data/alignment.ts';
 
 dotenv.config();
@@ -205,10 +205,15 @@ async function startServer() {
     const projectBase = Array.from(stem).slice(0, 10).join('')
       .replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_')
       .replace(/[. ]+$/g, '') || 'episode';
-    let projectName = projectBase;
+    const RESERVED_PUBLIC_DIRS = new Set(['assets', 'tts', 'renders', 'uploads', 'output']);
+    let projectName = RESERVED_PUBLIC_DIRS.has(projectBase.toLowerCase()) ? `${projectBase}-2` : projectBase;
     let projectDir = path.join(AISTUDIO_DIR, projectName);
     for (let suffix = 2; ; suffix++) {
-      if (fs.existsSync(path.join(RENDERS_DIR, projectName))) {
+      if (
+        RESERVED_PUBLIC_DIRS.has(projectName.toLowerCase()) ||
+        fs.existsSync(path.join(PUBLIC_DIR, projectName)) ||
+        fs.existsSync(path.join(RENDERS_DIR, projectName))
+      ) {
         projectName = `${projectBase}-${suffix}`;
         projectDir = path.join(AISTUDIO_DIR, projectName);
         continue;
@@ -222,7 +227,7 @@ async function startServer() {
         projectDir = path.join(AISTUDIO_DIR, projectName);
       }
     }
-    fs.mkdirSync(path.join(RENDERS_DIR, projectName));
+    fs.mkdirSync(path.join(PUBLIC_DIR, projectName));
     const baseName = Array.from(stem
       .replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g, '_')
       .replace(/[. ]+$/g, '')).slice(0, 48).join('') || 'episode';
@@ -230,7 +235,7 @@ async function startServer() {
     const destPath = path.join(projectDir, savedName);
     const cleanupUpload = () => {
       fs.rmSync(destPath, { force: true });
-      for (const dir of [projectDir, path.join(RENDERS_DIR, projectName)]) {
+      for (const dir of [projectDir, path.join(PUBLIC_DIR, projectName)]) {
         try { fs.rmdirSync(dir); } catch { /* Keep nonempty folders. */ }
       }
     };
@@ -291,6 +296,7 @@ async function startServer() {
   app.use('/tts', express.static(TTS_DIR));
   app.use('/renders', express.static(RENDERS_DIR));
   app.use('/uploads', express.static(UPLOADS_DIR));
+  app.use(express.static(PUBLIC_DIR, { index: false }));
 
   app.get('/api/health', (_req, res) => {
     res.json({
@@ -306,7 +312,9 @@ async function startServer() {
       return;
     }
     const sourceDir = path.join(AISTUDIO_DIR, project);
-    const renderDir = path.join(RENDERS_DIR, project);
+    const renderDir = fs.existsSync(path.join(PUBLIC_DIR, project))
+      ? path.join(PUBLIC_DIR, project)
+      : path.join(RENDERS_DIR, project);
     if (!fs.existsSync(sourceDir) || !fs.existsSync(renderDir)) {
       res.status(404).json({ error: 'Project folder was not found.' });
       return;
@@ -459,17 +467,27 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
 
   app.post('/api/translate', async (req, res) => {
     try {
-      const { englishScript } = req.body as { englishScript: string };
+      const { englishScript, videoDuration } = req.body as {
+        englishScript: string;
+        videoDuration?: number;
+      };
       if (!englishScript || !englishScript.trim()) {
         res.status(400).json({ error: 'English script text is required.' });
         return;
       }
 
+      const durHint =
+        typeof videoDuration === 'number' && Number.isFinite(videoDuration) && videoDuration > 0
+          ? `Fit comfortably within ${videoDuration.toFixed(1)} seconds at natural 1.0x speaking speed (target ~${Math.max(15, Math.floor((videoDuration - 0.3) * 5.8))} Burmese characters/graphemes max, 1–2 short easy-to-read subtitle lines).`
+          : 'Keep it concise (1–2 short, easy-to-read subtitle lines).';
+
       const ai = getAiClient();
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Translate this short 8-10 second movie recap narration into natural, fast-paced spoken Burmese suitable for a viral Myanmar YouTube movie recap voiceover. Return ONLY the Burmese narration text with no quotes or notes:\n\n${englishScript.trim()}`,
-      });
+      const response = await withGeminiRetry(() =>
+        ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: `Rewrite this movie recap beat into natural, conversational spoken Burmese storytelling (like telling a story to a friend, NOT stiff book-style writing). Preserve character names, actions, cause, and outcome without adding facts. ${durHint} Return ONLY the Burmese narration text with no quotes or notes:\n\n${englishScript.trim()}`,
+        })
+      );
 
       const burmeseScript = response.text?.trim();
       if (!burmeseScript) {
@@ -477,11 +495,64 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
         return;
       }
 
-      res.json({ burmeseScript });
+      res.json({
+        burmeseScript,
+        estimatedSpeechSec: estimateBurmeseSpeechSec(burmeseScript),
+      });
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : 'Failed to translate narration.';
       console.error('Translate error:', err);
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post('/api/shorten-clip', async (req, res) => {
+    try {
+      const { burmeseScript, englishScript, sourceStart, sourceEnd } = req.body as {
+        burmeseScript: string;
+        englishScript?: string;
+        sourceStart: number;
+        sourceEnd: number;
+      };
+      if (!burmeseScript || !burmeseScript.trim()) {
+        res.status(400).json({ error: 'Burmese script text is required.' });
+        return;
+      }
+      const videoDuration = Math.max(1.5, Number(sourceEnd) - Number(sourceStart) || 5);
+      const targetGraphemes = Math.max(16, Math.floor((videoDuration - 0.35) * 5.6));
+
+      const ai = getAiClient();
+      const response = await withGeminiRetry(() =>
+        ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: `Condense this Burmese movie recap line so a narrator speaking at normal 1.0x speed finishes comfortably inside ${videoDuration.toFixed(1)} seconds (around ${targetGraphemes} Burmese characters/graphemes or fewer, 1–2 short readable subtitle lines).
+
+Rules:
+- Remove repetition and wordy filler ONLY.
+- Keep character names, key actions, cause/effect, and outcome intact (do NOT destroy story meaning or invent facts).
+- Use natural, conversational spoken Burmese storytelling (not stiff textbook style).
+- Return ONLY the shortened Burmese text with no quotes or explanations.
+
+English plot reference: ${(englishScript || '').trim() || '(none)'}
+Original Burmese text: ${burmeseScript.trim()}`,
+        })
+      );
+
+      const shortened = response.text?.trim();
+      if (!shortened) {
+        res.status(502).json({ error: 'Empty shortened narration returned from Gemini.' });
+        return;
+      }
+
+      res.json({
+        burmeseScript: shortened,
+        estimatedSpeechSec: estimateBurmeseSpeechSec(shortened),
+      });
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to shorten narration.';
+      console.error('Shorten clip error:', err);
       res.status(500).json({ error: message });
     }
   });
@@ -562,15 +633,16 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
         }
 
         try {
-          const prompt = `Analyze this ${chunk.durationSec.toFixed(1)}-second video clip and create a chronological YouTube movie recap storyboard with natural Burmese narration.
+          const prompt = `Analyze this ${chunk.durationSec.toFixed(1)}-second video clip and create a chronological YouTube movie recap storyboard with natural spoken Burmese storytelling.
 
 Rules:
-1. Do NOT copy or translate spoken/subtitle dialogue word-for-word. Describe all events using original recap narration wording for copyright safety.
-2. Cover the whole key plot chronologically. Remove repetition only. Preserve identities, actions, motivations, cause and effect, outcomes, important dialogue meaning, and reveals. Do not invent facts or change chronology. Compare narration against the source context before returning it.
-3. Prefer concise segments, but retain essential meaning even when a segment must be longer.
-4. Provide accurate sourceStart and sourceEnd in seconds relative to THIS video clip (0 to ${chunk.durationSec.toFixed(1)}), with sourceEnd > sourceStart + 1.2.
-5. Set targetDuration as an estimate at a natural speaking pace; short durations are preferences, never hard caps. Select enough relevant footage to fit narration at 0.85x–1.15x video playback. Do not borrow unrelated scenes.
-6. Write natural, clear spoken Burmese (Myanmar Unicode) in burmeseScript, plus concise English summary in englishScript and a short 2-3 word title.`;
+1. Do NOT copy or translate spoken/subtitle dialogue word-for-word. Tell the story in original spoken Burmese recap style for copyright safety.
+2. Preserve full plot meaning chronologically: keep character identities, actions, motivations, cause and effect, key dialogue meaning, reveals, and outcomes without inventing facts. Skip only dead pauses or repetitive filler—a 10–15 minute episode should naturally condense to ~5–8 minutes (or shorter if plot density is light).
+3. Use natural, conversational spoken Burmese storytelling (engaging, easy for viewers to follow—NOT stiff textbook paragraphs).
+4. Keep every clip's burmeseScript short and easy to read on screen (1 crisp sentence, roughly 20–45 Burmese characters/graphemes, max 1–2 subtitle lines).
+5. IMPORTANT — Expand video time for explanations at 1.0x speed: Each clip plays at strict 1.0x speed with NO speed-up or slow-down. Always make (sourceEnd - sourceStart) long enough for a narrator speaking at natural speed (~5.5–6 Burmese graphemes/sec) to finish comfortably. If an explanation needs more time, expand sourceEnd further within the scene (e.g. 7–14 seconds) or split the beat into two sequential chronological clips (never cram a long paragraph into a 4-second clip).
+6. Provide accurate, strictly chronological, non-overlapping timestamps relative to THIS video clip (0 to ${chunk.durationSec.toFixed(1)}), with sourceEnd >= sourceStart + 2.5 and targetDuration = sourceEnd - sourceStart.
+7. Return burmeseScript (Myanmar Unicode), concise englishScript summary, and a short 2–4 word title.`;
 
           const response = await withGeminiRetry(() =>
             ai.models.generateContent({
@@ -627,16 +699,20 @@ Rules:
             burmeseScript: string;
           }>;
 
+          let prevRelEnd = 0;
           for (const item of parsed) {
-            const relStart = Math.max(0, Math.min(chunk.durationSec - 1.5, Number(item.sourceStart) || 0));
-            const relEnd = Math.max(relStart + 1.2, Math.min(chunk.durationSec, Number(item.sourceEnd) || relStart + 4));
-            const targetDur = Math.max(1, Number(item.targetDuration) || relEnd - relStart);
+            const rawStart = Math.max(prevRelEnd, Number(item.sourceStart) || 0);
+            if (rawStart >= chunk.durationSec - 1.2) continue;
+            const relStart = Math.max(0, Math.min(chunk.durationSec - 1.5, rawStart));
+            const relEnd = Math.max(relStart + 1.2, Math.min(chunk.durationSec, Number(item.sourceEnd) || relStart + 5));
+            prevRelEnd = relEnd;
+            const spanDur = relEnd - relStart;
             allClips.push({
               id: nextId,
               title: `${String(nextId).padStart(2, '0')}. ${(item.title || `Scene ${nextId}`).replace(/^\d+\.\s*/, '')}`,
               sourceStart: Number((chunk.offsetSec + relStart).toFixed(2)),
               sourceEnd: Number((chunk.offsetSec + relEnd).toFixed(2)),
-              targetDuration: Number(targetDur.toFixed(2)),
+              targetDuration: Number(spanDur.toFixed(2)),
               englishScript: String(item.englishScript || '').trim(),
               burmeseScript: String(item.burmeseScript || '').trim(),
             });
@@ -728,11 +804,12 @@ Rules:
       const {
         clips,
         sourceVideoUrl,
-        includeSubtitles = true,
-        maskBottomSubtitles = true,
-        sourceAudioVolume = 0.14,
+        includeSubtitles = false,
+        maskBottomSubtitles = false,
+        sourceAudioVolume = 0,
         voiceoverVolume = 1.0,
         scriptSource = 'gemini',
+        videoOnly,
         sample = false,
       } = req.body as {
         clips: RenderClipInput[];
@@ -742,6 +819,7 @@ Rules:
         sourceAudioVolume?: number;
         voiceoverVolume?: number;
         scriptSource?: 'gemini' | 'srt';
+        videoOnly?: boolean;
         sample?: boolean;
       };
       const fromSrt = scriptSource === 'srt';
@@ -758,25 +836,38 @@ Rules:
         res.status(400).json({ error: 'At least one recap clip is required.' });
         return;
       }
-      const invalid = clips.findIndex((clip, i) =>
+
+      const useVideoOnly = videoOnly ?? clips.every((c) => !c?.audioUrl);
+
+      const invalidRange = clips.findIndex((clip, i) =>
         !clip || !Number.isFinite(clip.sourceStart) || !Number.isFinite(clip.sourceEnd) ||
         clip.sourceStart < 0 || clip.sourceEnd <= clip.sourceStart ||
         clip.sourceEnd > sourceInfo.durationSec || typeof clip.burmeseScript !== 'string' ||
         (i > 0 && clip.sourceStart < clips[i - 1].sourceEnd) ||
-        !clip.burmeseScript.trim() || typeof clip.audioUrl !== 'string' ||
-        !/^\/tts\/clip-\d+-[a-f0-9]{12}\.(mp3|wav)$/.test(clip.audioUrl) ||
-        !fs.existsSync(path.join(TTS_DIR, path.basename(clip.audioUrl))));
-      if (invalid >= 0) {
-        res.status(400).json({ error: `Segment ${invalid + 1} needs a chronological source range and generated narration. Regenerate audio before exporting.` });
+        !clip.burmeseScript.trim()
+      );
+      if (invalidRange >= 0) {
+        res.status(400).json({ error: `Segment ${invalidRange + 1} needs a valid chronological source range (within 0–${sourceInfo.durationSec.toFixed(1)}s) and non-empty Burmese text.` });
         return;
       }
 
-      for (const clip of clips) {
-        const voices = clip.audioUrl!.endsWith('.mp3')
-          ? ['my-MM-ThihaNeural', 'my-MM-NilarNeural'].map(voice => `${voice}:+0%:${clip.burmeseScript.trim()}`)
-          : ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'].map(voice => `natural-v2:${voice}:${clip.burmeseScript.trim()}`);
-        if (!voices.some(key => clip.audioUrl!.includes(crypto.createHash('sha1').update(key).digest('hex').slice(0, 12)))) {
-          throw new Error(`Segment ${clip.id}: narration changed or audio uses an old speaking style. Regenerate its audio.`);
+      if (!useVideoOnly) {
+        const invalidAudio = clips.findIndex((clip) =>
+          typeof clip.audioUrl !== 'string' ||
+          !/^\/tts\/clip-\d+-[a-f0-9]{12}\.(mp3|wav)$/.test(clip.audioUrl) ||
+          !fs.existsSync(path.join(TTS_DIR, path.basename(clip.audioUrl)))
+        );
+        if (invalidAudio >= 0) {
+          res.status(400).json({ error: `Segment ${invalidAudio + 1} needs generated narration audio before exporting.` });
+          return;
+        }
+        for (const clip of clips) {
+          const voices = clip.audioUrl!.endsWith('.mp3')
+            ? ['my-MM-ThihaNeural', 'my-MM-NilarNeural'].map(voice => `${voice}:+0%:${clip.burmeseScript.trim()}`)
+            : ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'].map(voice => `natural-v2:${voice}:${clip.burmeseScript.trim()}`);
+          if (!voices.some(key => clip.audioUrl!.includes(crypto.createHash('sha1').update(key).digest('hex').slice(0, 12)))) {
+            throw new Error(`Segment ${clip.id}: narration changed or audio uses an old speaking style. Regenerate its audio.`);
+          }
         }
       }
 
@@ -790,13 +881,15 @@ Rules:
 
       const mergedRawPath = path.join(tempDir, 'merged.mp4');
       const subtitleTimings: Array<{ start: number; end: number; burmese: string }> = [];
-      let subtitleTiming = 'aligned';
+      let subtitleTiming = useVideoOnly ? 'scene-matched' : 'aligned';
 
       {
         const segmentPaths: string[] = [];
         const segmentDurations: number[] = [];
 
         let cumulativeTime = 0;
+        const clampedBgVol = Math.max(0, Math.min(1, Number(sourceAudioVolume)));
+        const keepSourceAudio = sourceInfo.hasAudio && clampedBgVol > 0.001;
 
         for (let i = 0; i < clips.length; i++) {
           const clip = clips[i];
@@ -804,10 +897,6 @@ Rules:
           const srcEnd = clip.sourceEnd;
           const rawSrcDur = srcEnd - srcStart;
 
-          const localAudioPath = path.join(TTS_DIR, path.basename(clip.audioUrl!));
-          const ttsDur = await probeDuration(localAudioPath);
-          const { duration: clipDuration, speed } = getSegmentTiming(clip, ttsDur);
-          const speedRatio = 1 / speed;
           const segOutPath = path.join(
             tempDir,
             `seg-${String(i).padStart(2, '0')}.mp4`
@@ -817,51 +906,109 @@ Rules:
             'scale=1280:720:force_original_aspect_ratio=increase',
             'crop=1280:720',
             'fps=25',
-            `setpts=${speedRatio.toFixed(6)}*PTS`,
           ];
 
-          if (maskBottomSubtitles) {
-            videoFilters.push(
-              'drawbox=x=0:y=592:w=1280:h=128:color=black@0.82:t=fill'
-            );
-          }
+          if (useVideoOnly) {
+            if (maskBottomSubtitles) {
+              videoFilters.push(
+                'drawbox=x=0:y=592:w=1280:h=128:color=black@0.82:t=fill'
+              );
+            }
 
-          const args: string[] = [
-            '-y',
-            '-ss',
-            srcStart.toFixed(3),
-            '-t',
-            rawSrcDur.toFixed(3),
-            '-i',
-            sourcePath,
-          ];
-
-          if (!sourceInfo.hasAudio) {
-            args.push(
-              '-f',
-              'lavfi',
+            const args: string[] = [
+              '-y',
+              '-ss',
+              srcStart.toFixed(3),
               '-t',
-              clipDuration.toFixed(3),
+              rawSrcDur.toFixed(3),
               '-i',
-              'anullsrc=channel_layout=stereo:sample_rate=48000'
-            );
-          }
+              sourcePath,
+              '-vf',
+              videoFilters.join(','),
+              '-t',
+              rawSrcDur.toFixed(3),
+              '-c:v',
+              'libx264',
+              '-preset',
+              'veryfast',
+              '-crf',
+              '24',
+              '-maxrate',
+              '950k',
+              '-bufsize',
+              '1900k',
+              '-pix_fmt',
+              'yuv420p',
+            ];
 
-          const voInputIndex = sourceInfo.hasAudio ? 1 : 2;
-          if (localAudioPath) {
+            if (keepSourceAudio) {
+              args.push(
+                '-af',
+                `volume=${clampedBgVol.toFixed(2)},aformat=sample_rates=48000:channel_layouts=stereo,apad=whole_dur=${rawSrcDur.toFixed(3)},atrim=duration=${rawSrcDur.toFixed(3)}`,
+                '-c:a',
+                'aac',
+                '-b:a',
+                '192k'
+              );
+            } else {
+              args.push('-an');
+            }
+
+            args.push(segOutPath);
+
+            await execFileAsync('ffmpeg', args);
+            segmentPaths.push(segOutPath);
+            segmentDurations.push(rawSrcDur);
+
+            subtitleTimings.push({
+              start: cumulativeTime,
+              end: cumulativeTime + rawSrcDur,
+              burmese: wrapBurmeseCueLines(clip.burmeseScript),
+            });
+            cumulativeTime += rawSrcDur;
+          } else {
+            const localAudioPath = path.join(TTS_DIR, path.basename(clip.audioUrl!));
+            const ttsDur = await probeDuration(localAudioPath);
+            const { duration: clipDuration, speed } = getSegmentTiming(clip, ttsDur);
+            const speedRatio = 1 / speed;
+            videoFilters.push(`setpts=${speedRatio.toFixed(6)}*PTS`);
+
+            if (maskBottomSubtitles) {
+              videoFilters.push(
+                'drawbox=x=0:y=592:w=1280:h=128:color=black@0.82:t=fill'
+              );
+            }
+
+            const args: string[] = [
+              '-y',
+              '-ss',
+              srcStart.toFixed(3),
+              '-t',
+              rawSrcDur.toFixed(3),
+              '-i',
+              sourcePath,
+            ];
+
+            if (!sourceInfo.hasAudio) {
+              args.push(
+                '-f',
+                'lavfi',
+                '-t',
+                clipDuration.toFixed(3),
+                '-i',
+                'anullsrc=channel_layout=stereo:sample_rate=48000'
+              );
+            }
+
+            const voInputIndex = sourceInfo.hasAudio ? 1 : 2;
             args.push('-i', localAudioPath);
-          }
 
-          const clampedBgVol = Math.max(0, Math.min(1, Number(sourceAudioVolume)));
-          const clampedVoVol = Math.max(0, Math.min(2, Number(voiceoverVolume)));
+            const clampedVoVol = Math.max(0, Math.min(2, Number(voiceoverVolume)));
+            const filterParts: string[] = [
+              `[0:v]${videoFilters.join(',')}[vout]`,
+            ];
+            const bgSourceRef = sourceInfo.hasAudio ? '[0:a]' : '[1:a]';
 
-          const filterParts: string[] = [
-            `[0:v]${videoFilters.join(',')}[vout]`,
-          ];
-
-          const bgSourceRef = sourceInfo.hasAudio ? '[0:a]' : '[1:a]';
-
-          if (localAudioPath) {
             const bgFilters: string[] = [];
             const tempo = 1 / speedRatio;
             if (sourceInfo.hasAudio && tempo >= 0.5 && tempo <= 2.0) {
@@ -881,43 +1028,47 @@ Rules:
             filterParts.push(
               `[bg][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
             );
+
+            args.push(
+              '-filter_complex',
+              filterParts.join(';'),
+              '-map',
+              '[vout]',
+              '-map',
+              '[aout]',
+              '-t',
+              clipDuration.toFixed(3),
+              '-c:v',
+              'libx264',
+              '-preset',
+              'veryfast',
+              '-crf',
+              '24',
+              '-maxrate',
+              '950k',
+              '-bufsize',
+              '1900k',
+              '-pix_fmt',
+              'yuv420p',
+              '-c:a',
+              'aac',
+              '-b:a',
+              '192k',
+              segOutPath
+            );
+
+            await execFileAsync('ffmpeg', args);
+            segmentPaths.push(segOutPath);
+            segmentDurations.push(clipDuration);
+
+            const cueData = narrationCues(localAudioPath, clip.burmeseScript, ttsDur);
+            if (cueData.subtitleTiming === 'approximate') subtitleTiming = 'approximate';
+            subtitleTimings.push(...cueData.subtitleCues.map(cue => ({
+              ...cue, start: cumulativeTime + cue.start, end: cumulativeTime + cue.end,
+            })));
+
+            cumulativeTime += clipDuration;
           }
-
-          args.push(
-            '-filter_complex',
-            filterParts.join(';'),
-            '-map',
-            '[vout]',
-            '-map',
-            '[aout]',
-            '-t',
-            clipDuration.toFixed(3),
-            '-c:v',
-            'libx264',
-            '-preset',
-            'veryfast',
-            '-crf',
-            '21',
-            '-pix_fmt',
-            'yuv420p',
-            '-c:a',
-            'aac',
-            '-b:a',
-            '192k',
-            segOutPath
-          );
-
-          await execFileAsync('ffmpeg', args);
-          segmentPaths.push(segOutPath);
-          segmentDurations.push(clipDuration);
-
-          const cueData = narrationCues(localAudioPath, clip.burmeseScript, ttsDur);
-          if (cueData.subtitleTiming === 'approximate') subtitleTiming = 'approximate';
-          subtitleTimings.push(...cueData.subtitleCues.map(cue => ({
-            ...cue, start: cumulativeTime + cue.start, end: cumulativeTime + cue.end,
-          })));
-
-          cumulativeTime += clipDuration;
         }
 
         const concatListPath = path.join(tempDir, 'concat.txt');
@@ -949,20 +1100,23 @@ Rules:
       const finalMp4Name = `${name}.mp4`;
       const finalSrtName = `${name}.srt`;
       const projectName = projectNameFromSource(sourcePath);
-      const outputDir = projectName ? path.join(RENDERS_DIR, projectName) : RENDERS_DIR;
+      const publicFolder = projectName || 'output';
+      const outputDir = path.join(PUBLIC_DIR, publicFolder);
       fs.mkdirSync(outputDir, { recursive: true });
       const finalMp4Path = path.join(outputDir, finalMp4Name);
       const finalSrtPath = path.join(outputDir, finalSrtName);
       const tempMp4Path = path.join(tempDir, finalMp4Name);
       const tempSrtPath = path.join(tempDir, finalSrtName);
 
-      // Write SRT for external YouTube upload
-      const srtContent = subtitleTimings
-        .map(
-          (item, idx) =>
-            `${idx + 1}\n${formatSrtTime(item.start)} --> ${formatSrtTime(item.end)}\n${item.burmese}\n`
-        )
-        .join('\n');
+      // Write SRT for external YouTube upload / local Edge-TTS sync
+      const srtContent = useVideoOnly
+        ? buildSrtFromClips(clips)
+        : subtitleTimings
+            .map(
+              (item, idx) =>
+                `${idx + 1}\n${formatSrtTime(item.start)} --> ${formatSrtTime(item.end)}\n${item.burmese}\n`
+            )
+            .join('\n');
       fs.writeFileSync(tempSrtPath, srtContent, 'utf8');
 
       if (includeSubtitles) {
@@ -1003,7 +1157,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             '-preset',
             'veryfast',
             '-crf',
-            '20',
+            '24',
+            '-maxrate',
+            '950k',
+            '-bufsize',
+            '1900k',
             '-pix_fmt',
             'yuv420p',
             '-c:a',
@@ -1033,15 +1191,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       const totalDuration = await probeDuration(finalMp4Path);
 
       res.json({
-        videoUrl: `/renders/${projectName ? `${encodeURIComponent(projectName)}/` : ''}${finalMp4Name}`,
-        srtUrl: `/renders/${projectName ? `${encodeURIComponent(projectName)}/` : ''}${finalSrtName}`,
+        videoUrl: `/${encodeURIComponent(publicFolder)}/${finalMp4Name}`,
+        srtUrl: `/${encodeURIComponent(publicFolder)}/${finalSrtName}`,
         downloadUrl: projectName ? `/api/projects/${encodeURIComponent(projectName)}/download` : undefined,
         durationSec: totalDuration,
         fileSizeBytes: stats.size,
         width: 1280,
         height: 720,
         subtitleTiming,
-        warning: subtitleTiming === 'approximate' ? 'Subtitle phrases use approximate timing, not speech alignment. Review the sample before processing the full project.' : 'Subtitles use provider speech boundaries. Review the sample before processing the full project.',
+        warning: useVideoOnly
+          ? undefined
+          : subtitleTiming === 'approximate'
+            ? 'Subtitle phrases use approximate timing, not speech alignment. Review the sample before processing the full project.'
+            : 'Subtitles use provider speech boundaries. Review the sample before processing the full project.',
       });
     } catch (err: unknown) {
       const message =

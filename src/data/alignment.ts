@@ -1,4 +1,4 @@
-import { buildSubtitleCues } from './timing';
+import { buildSubtitleCues } from './timing.ts';
 
 type Boundary = { type: string; offset: number; duration: number; text: string };
 const graphemes = new Intl.Segmenter('my', { granularity: 'grapheme' });

@@ -3,38 +3,28 @@ import {
   Copy,
   Languages,
   Loader2,
-  Mic,
   Play,
-  Volume2,
+  Scissors,
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
-import type { ClipAudioState, RecapClip } from '../data/recapClips';
-
-const VOICE_OPTIONS = [
-  { id: 'Charon', label: 'Charon (Deep Storyteller)' },
-  { id: 'Kore', label: 'Kore (Clear Narrator)' },
-  { id: 'Puck', label: 'Puck (Fast & Energetic)' },
-  { id: 'Fenrir', label: 'Fenrir (Dramatic Trailer)' },
-  { id: 'Zephyr', label: 'Zephyr (Smooth Recap)' },
-];
+import { useEffect, useState } from 'react';
+import type { RecapClip } from '../data/recapClips';
+import { getClipPaceCheck } from '../data/timing';
 
 interface ScriptPanelProps {
   clips: RecapClip[];
   activeClipIndex: number;
-  audioMap: Record<number, ClipAudioState>;
-  selectedVoice: string;
-  onVoiceChange: (voice: string) => void;
+  clipErrorMap: Record<number, string>;
   onSelectClip: (index: number) => void;
   onUpdateClip: (
     clipId: number,
     patch: Partial<Pick<RecapClip, 'burmeseScript' | 'englishScript' | 'sourceStart' | 'sourceEnd'>>
   ) => void;
-  onGenerateClipAudio: (clip: RecapClip) => Promise<void>;
-  onGenerateAllAudio: () => Promise<void>;
-  isGeneratingAll: boolean;
-  generationProgressText: string | null;
+  onShortenClip: (clip: RecapClip) => Promise<void>;
+  onShortenAllLongClips: () => Promise<void>;
+  isShorteningAll: boolean;
+  progressNote: string | null;
   onTranslateClip: (clip: RecapClip) => Promise<void>;
-  translatingClipId: number | null;
+  busyClipId: number | null;
   fromSrt: boolean;
   busy: boolean;
 }
@@ -48,44 +38,82 @@ function formatSourceRange(start: number, end: number): string {
   return `${fmt(start)}–${fmt(end)}`;
 }
 
+function TimestampInput({
+  label,
+  value,
+  disabled,
+  ariaLabel,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  disabled: boolean;
+  ariaLabel: string;
+  onCommit: (next: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+
+  useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+
+  const commit = () => {
+    const parsed = Number(draft);
+    if (!Number.isFinite(parsed) || draft.trim() === '') {
+      setDraft(String(value));
+      return;
+    }
+    if (parsed !== value) {
+      onCommit(parsed);
+    }
+  };
+
+  return (
+    <label className="flex items-center gap-2">
+      <span>{label}</span>
+      <input
+        type="number"
+        min={0}
+        step={0.1}
+        value={draft}
+        disabled={disabled}
+        aria-label={ariaLabel}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            commit();
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        className="w-20 rounded bg-slate-900 border border-slate-800 px-2 py-1 text-slate-100 font-mono tabular-nums"
+      />
+    </label>
+  );
+}
+
 export default function ScriptPanel({
   clips,
   activeClipIndex,
-  audioMap,
-  selectedVoice,
-  onVoiceChange,
+  clipErrorMap,
   onSelectClip,
   onUpdateClip,
-  onGenerateClipAudio,
-  onGenerateAllAudio,
-  isGeneratingAll,
-  generationProgressText,
+  onShortenClip,
+  onShortenAllLongClips,
+  isShorteningAll,
+  progressNote,
   onTranslateClip,
-  translatingClipId,
+  busyClipId,
   fromSrt,
   busy,
 }: ScriptPanelProps) {
   const [copiedBurmese, setCopiedBurmese] = useState(false);
-  const [previewPlayingId, setPreviewPlayingId] = useState<number | null>(null);
-  const previewAudio = useRef<{ audio: HTMLAudioElement; clipId: number; url: string } | null>(null);
 
-  useEffect(() => {
-    const preview = previewAudio.current;
-    if (preview && (audioMap[preview.clipId]?.audioUrl !== preview.url || audioMap[preview.clipId]?.status !== 'ready')) {
-      preview.audio.pause();
-      previewAudio.current = null;
-      setPreviewPlayingId(null);
-    }
-  }, [audioMap]);
-
-  useEffect(() => () => {
-    previewAudio.current?.audio.pause();
-    previewAudio.current = null;
-  }, []);
-
-  const readyAudioCount = clips.filter(
-    (c) => audioMap[c.id]?.status === 'ready'
-  ).length;
+  const totalSec = clips.reduce(
+    (sum, c) => sum + Math.max(0, c.sourceEnd - c.sourceStart),
+    0
+  );
+  const longClipCount = clips.filter((c) => getClipPaceCheck(c).status === 'long').length;
 
   const handleCopyFullBurmese = async () => {
     const fullText = clips
@@ -99,103 +127,79 @@ export default function ScriptPanel({
     setTimeout(() => setCopiedBurmese(false), 2000);
   };
 
-  const handlePlaySingleAudio = (clipId: number, url: string) => {
-    previewAudio.current?.audio.pause();
-    const audio = new Audio(url);
-    previewAudio.current = { audio, clipId, url };
-    setPreviewPlayingId(clipId);
-    const finish = () => {
-      if (previewAudio.current?.audio === audio) {
-        previewAudio.current = null;
-        setPreviewPlayingId(null);
-      }
-    };
-    audio.onended = finish;
-    audio.onerror = finish;
-    audio.play().catch(finish);
-  };
-
   return (
     <aside
       id="script-section"
-      aria-label="Burmese Recap Script and Voiceover Editor"
+      aria-label="Burmese Recap Script and Timing Editor"
       className="bg-[#111622] border border-slate-800 rounded-xl flex flex-col overflow-hidden"
     >
-      {/* Header & Voiceover Controls */}
+      {/* Header & Batch Actions */}
       <div className="p-4 border-b border-slate-800 flex flex-col gap-3">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h2 className="text-base font-semibold text-white">
-              {fromSrt ? 'SRT Narration Script' : 'Burmese Recap Script'}
+              {fromSrt ? 'SRT Cues' : 'Burmese Storytelling Script'}
             </h2>
             <p className="text-xs text-slate-400 font-mono tabular-nums mt-0.5">
-              {clips.length} clips · {readyAudioCount}/{clips.length} Burmese
-              voiceovers ready
+              {clips.length} cues · {Math.floor(totalSec / 60)}m {Math.round(totalSec % 60)}s total ·{' '}
+              {longClipCount > 0 ? (
+                <span className="text-rose-400">{longClipCount} longer than 1.0x cut</span>
+              ) : (
+                <span className="text-emerald-400">all fit at 1.0x</span>
+              )}
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={handleCopyFullBurmese}
-            className="h-9 px-3 inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-[#161D2D] hover:bg-slate-800 text-xs font-medium text-slate-200 transition-colors whitespace-nowrap shrink-0"
-          >
-            {copiedBurmese ? (
-              <>
-                <Check className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Copied Burmese</span>
-              </>
-            ) : (
-              <>
-                <Copy className="w-3.5 h-3.5" />
-                <span>Copy Script</span>
-              </>
+          <div className="flex items-center gap-2">
+            {longClipCount > 0 && (
+              <button
+                type="button"
+                onClick={() => void onShortenAllLongClips()}
+                disabled={busy}
+                className="h-9 px-3 inline-flex items-center gap-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 disabled:opacity-60 text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
+              >
+                {isShorteningAll ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>{progressNote || 'Shortening...'}</span>
+                  </>
+                ) : (
+                  <>
+                    <Scissors className="w-3.5 h-3.5" />
+                    <span>Shorten {longClipCount} Long Cues</span>
+                  </>
+                )}
+              </button>
             )}
-          </button>
-        </div>
 
-        {/* Voice selector + Generate All */}
-        <div className="flex flex-wrap items-center gap-2.5">
-          {!fromSrt && <select
-            aria-label="Select AI Narrator Voice"
-            value={selectedVoice}
-            onChange={(e) => onVoiceChange(e.target.value)}
-            className="h-10 px-3 rounded-lg bg-[#0B0F17] border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-rose-500 flex-1 min-w-[180px]"
-          >
-            {VOICE_OPTIONS.map((v) => (
-              <option key={v.id} value={v.id}>
-                {v.label}
-              </option>
-            ))}
-          </select>}
-
-          <button
-            type="button"
-            onClick={onGenerateAllAudio}
-            disabled={busy}
-            className="h-10 px-4 inline-flex items-center justify-center gap-2 rounded-lg bg-slate-100 hover:bg-white text-slate-950 disabled:opacity-60 text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
-          >
-            {isGeneratingAll ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                <span>{generationProgressText || 'Generating...'}</span>
-              </>
-            ) : (
-              <>
-                <Mic className="w-3.5 h-3.5" />
-                <span>Generate All Burmese Voiceovers</span>
-              </>
-            )}
-          </button>
+            <button
+              type="button"
+              onClick={handleCopyFullBurmese}
+              className="h-9 px-3 inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-[#161D2D] hover:bg-slate-800 text-xs font-medium text-slate-200 transition-colors whitespace-nowrap shrink-0"
+            >
+              {copiedBurmese ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Copied</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Copy Script</span>
+                </>
+              )}
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* Scrollable 12-clip rows */}
+      {/* Scrollable cues list */}
       <div className="divide-y divide-slate-800/80 max-h-[680px] overflow-y-auto">
         {clips.map((clip, idx) => {
           const isActive = idx === activeClipIndex;
-          const audioState = audioMap[clip.id] ?? { status: 'idle' };
-          const isGeneratingThis = audioState.status === 'generating';
-          const isTranslatingThis = translatingClipId === clip.id;
+          const isBusyThis = busyClipId === clip.id;
+          const pace = getClipPaceCheck(clip);
+          const errorMsg = clipErrorMap[clip.id];
 
           return (
             <div
@@ -205,9 +209,9 @@ export default function ScriptPanel({
                 isActive ? 'bg-[#171F30]' : 'hover:bg-[#141A28]'
               }`}
             >
-              {/* Quiet metadata line + per-clip controls */}
+              {/* Metadata line + per-clip controls */}
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2 text-xs text-slate-400">
+                <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
                   <span
                     className={`font-semibold ${
                       isActive ? 'text-rose-400' : 'text-slate-200'
@@ -217,13 +221,20 @@ export default function ScriptPanel({
                   </span>
                   <span aria-hidden="true">·</span>
                   <span className="font-mono tabular-nums">
-                    {formatSourceRange(clip.sourceStart, clip.sourceEnd)}
+                    {formatSourceRange(clip.sourceStart, clip.sourceEnd)} ({pace.videoDuration.toFixed(1)}s)
                   </span>
-                  <span aria-hidden="true">·</span>
-                  <span className="font-mono tabular-nums">
-                    {audioState.durationSec
-                      ? `${audioState.durationSec.toFixed(1)}s VO`
-                      : `${clip.targetDuration.toFixed(1)}s`}
+                  <span
+                    className={`font-mono tabular-nums px-1.5 py-0.5 rounded text-[11px] ${
+                      pace.status === 'long'
+                        ? 'bg-rose-950/70 text-rose-300 border border-rose-800/60'
+                        : pace.status === 'tight'
+                          ? 'bg-amber-950/60 text-amber-300 border border-amber-800/50'
+                          : 'bg-emerald-950/60 text-emerald-300 border border-emerald-800/50'
+                    }`}
+                  >
+                    {pace.status === 'long'
+                      ? `~${pace.estimatedSpeechSec.toFixed(1)}s speech (+${pace.overflowSec.toFixed(1)}s long)`
+                      : `~${pace.estimatedSpeechSec.toFixed(1)}s speech`}
                   </span>
                 </div>
 
@@ -241,59 +252,53 @@ export default function ScriptPanel({
                     <span>Seek</span>
                   </button>
 
-                  {audioState.audioUrl && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        handlePlaySingleAudio(clip.id, audioState.audioUrl!)
-                      }
-                      title="Listen to generated Burmese voiceover"
-                      className="h-8 px-2.5 inline-flex items-center gap-1 rounded-md border border-emerald-700/60 bg-emerald-950/40 hover:bg-emerald-900/50 text-[11px] font-medium text-emerald-300 whitespace-nowrap"
-                    >
-                      <Volume2 className="w-3 h-3" />
-                      <span>
-                        {previewPlayingId === clip.id ? 'Playing' : 'Listen'}
-                      </span>
-                    </button>
-                  )}
-
                   <button
                     type="button"
-                    onClick={() => onGenerateClipAudio(clip)}
+                    onClick={() => void onShortenClip(clip)}
                     disabled={busy}
-                    className="h-8 px-2.5 inline-flex items-center gap-1 rounded-md border border-slate-700/80 bg-[#0B0F17] hover:bg-slate-800 disabled:opacity-50 text-[11px] font-medium text-slate-200 whitespace-nowrap"
+                    title="Condense repetition while preserving story meaning to fit 1.0x clip duration"
+                    className="h-8 px-2.5 inline-flex items-center gap-1 rounded-md border border-amber-700/60 bg-amber-950/30 hover:bg-amber-900/40 disabled:opacity-50 text-[11px] font-medium text-amber-200 whitespace-nowrap"
                   >
-                    {isGeneratingThis ? (
+                    {isBusyThis ? (
                       <Loader2 className="w-3 h-3 animate-spin" />
                     ) : (
-                      <Mic className="w-3 h-3" />
+                      <Scissors className="w-3 h-3" />
                     )}
-                    <span>{audioState.audioUrl ? 'Regen VO' : 'Gen VO'}</span>
+                    <span>Shorten to Fit</span>
                   </button>
                 </div>
               </div>
 
-              <div className="flex gap-3 text-xs text-slate-400" onClick={(event) => event.stopPropagation()}>
-                {(['sourceStart', 'sourceEnd'] as const).map((field) => (
-                  <label key={`${clip.id}-${field}-${clip[field]}`} className="flex items-center gap-2">
-                    {field === 'sourceStart' ? 'Source start (s)' : 'Source end (s)'}
-                    <input type="number" min={0} step={0.1} defaultValue={clip[field]} disabled={busy}
-                      className="w-20 rounded bg-slate-900 p-1 text-slate-100" aria-label={`${field} for ${clip.title}`}
-                      onBlur={(event) => {
-                        if (event.target.value !== '' && Number(event.target.value) !== clip[field]) {
-                          onUpdateClip(clip.id, { [field]: Number(event.target.value) });
-                        }
-                      }} />
-                  </label>
-                ))}
+              <div
+                className="flex flex-wrap gap-3 text-xs text-slate-400"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <TimestampInput
+                  label="Start (s)"
+                  value={clip.sourceStart}
+                  disabled={busy}
+                  ariaLabel={`sourceStart for ${clip.title}`}
+                  onCommit={(val) => onUpdateClip(clip.id, { sourceStart: val })}
+                />
+                <TimestampInput
+                  label="End (s)"
+                  value={clip.sourceEnd}
+                  disabled={busy}
+                  ariaLabel={`sourceEnd for ${clip.title}`}
+                  onCommit={(val) => onUpdateClip(clip.id, { sourceEnd: val })}
+                />
+                <span className="self-center font-mono tabular-nums text-[11px] text-slate-500">
+                  {pace.graphemes} chars
+                </span>
               </div>
-              {/* Editable Burmese narration */}
+
+              {/* Editable Burmese storytelling cue */}
               <div onClick={(e) => e.stopPropagation()}>
                 <textarea
                   lang="my"
-                  rows={3}
+                  rows={2}
                   value={clip.burmeseScript}
-                  disabled={fromSrt && busy}
+                  disabled={busy}
                   onChange={(e) =>
                     onUpdateClip(clip.id, { burmeseScript: e.target.value })
                   }
@@ -307,28 +312,28 @@ export default function ScriptPanel({
                 onClick={(e) => e.stopPropagation()}
                 className="flex flex-col gap-1.5"
               >
-                {!fromSrt && <div className="flex items-start justify-between gap-2">
-                  <p className="text-xs leading-relaxed text-slate-400">
-                    {clip.englishScript}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => onTranslateClip(clip)}
-                    disabled={busy}
-                    title="Re-translate English to Burmese via Gemini"
-                    className="h-7 px-2 inline-flex items-center gap-1 rounded border border-slate-800 bg-[#0B0F17] hover:bg-slate-800 text-[11px] text-slate-400 hover:text-slate-200 shrink-0 whitespace-nowrap"
-                  >
-                    {isTranslatingThis ? (
-                      <Loader2 className="w-3 h-3 animate-spin" />
-                    ) : (
-                      <Languages className="w-3 h-3" />
-                    )}
-                    <span>Refresh MY</span>
-                  </button>
-                </div>}
-                {audioState.status === 'error' && audioState.error && (
-                  <p className="text-xs text-rose-400">{audioState.error}</p>
+                {!fromSrt && clip.englishScript && (
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="text-xs leading-relaxed text-slate-400">
+                      {clip.englishScript}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => void onTranslateClip(clip)}
+                      disabled={busy}
+                      title="Rewrite Burmese storytelling from English summary within clip duration"
+                      className="h-7 px-2 inline-flex items-center gap-1 rounded border border-slate-800 bg-[#0B0F17] hover:bg-slate-800 text-[11px] text-slate-400 hover:text-slate-200 shrink-0 whitespace-nowrap"
+                    >
+                      {isBusyThis ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : (
+                        <Languages className="w-3 h-3" />
+                      )}
+                      <span>Refresh MY</span>
+                    </button>
+                  </div>
                 )}
+                {errorMsg && <p className="text-xs text-rose-400">{errorMsg}</p>}
               </div>
             </div>
           );

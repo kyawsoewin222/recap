@@ -1,7 +1,32 @@
-import type { RecapClip } from './recapClips';
+import type { RecapClip } from './recapClips.ts';
+import { wrapBurmeseCueLines } from './timing.ts';
 
 const timestamp = '(\\d{2,}):([0-5]\\d):([0-5]\\d)[,.](\\d{3})';
 const timing = new RegExp(`^${timestamp}\\s+-->\\s+${timestamp}$`);
+
+export function formatSrtTimestamp(seconds: number): string {
+  const clamped = Math.round(Math.max(0, seconds) * 1000);
+  const h = Math.floor(clamped / 3600000);
+  const m = Math.floor((clamped % 3600000) / 60000);
+  const s = Math.floor((clamped % 60000) / 1000);
+  const ms = clamped % 1000;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+}
+
+export function buildSrtFromClips(
+  clips: Array<Pick<RecapClip, 'sourceStart' | 'sourceEnd' | 'burmeseScript'>>
+): string {
+  let cursor = 0;
+  return clips
+    .map((clip, index) => {
+      const duration = Math.max(0, clip.sourceEnd - clip.sourceStart);
+      const start = cursor;
+      const end = cursor + duration;
+      cursor = end;
+      return `${index + 1}\n${formatSrtTimestamp(start)} --> ${formatSrtTimestamp(end)}\n${wrapBurmeseCueLines(clip.burmeseScript)}\n`;
+    })
+    .join('\n');
+}
 
 export function parseSrt(srt: string, durationSec: number): RecapClip[] {
   const content = srt.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trim();
