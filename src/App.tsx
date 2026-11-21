@@ -2,7 +2,7 @@ import { Upload } from 'lucide-react';
 import { useEffect, useRef, useState, type ChangeEvent } from 'react';
 import RecapPlayer, { type SubtitleMode } from './components/RecapPlayer';
 import ScriptPanel from './components/ScriptPanel';
-import { getClipPaceCheck } from './data/timing';
+import { getClipPaceCheck, getTightClipDuration } from './data/timing';
 import {
   INITIAL_RECAP_CLIPS,
   SOURCE_VIDEO_URL,
@@ -165,12 +165,38 @@ export default function App() {
       }
       setRenderResult(null);
       setPlayerMode('storyboard');
-      setProgressNote('Long cues shortened. Preview or export 16:9 MP4 + SRT.');
+    setProgressNote('Long cues shortened. Preview or export 16:9 MP4 + SRT.');
     } catch (err: unknown) {
       setRenderError(err instanceof Error ? err.message : 'Failed to shorten long cues.');
     } finally {
       setIsShorteningAll(false);
     }
+  };
+
+  const handleTightenAllGaps = () => {
+    if (busy) return;
+    let adjustedCount = 0;
+    const updated = clips.map((clip) => {
+      const pace = getClipPaceCheck(clip);
+      if (!pace.hasExcessGap) return clip;
+      const tightDur = getTightClipDuration(clip.burmeseScript);
+      const nextEnd = Number((clip.sourceStart + tightDur).toFixed(2));
+      if (nextEnd >= clip.sourceEnd) return clip;
+      adjustedCount++;
+      return {
+        ...clip,
+        sourceEnd: nextEnd,
+        targetDuration: Number(Math.max(0, nextEnd - clip.sourceStart).toFixed(2)),
+      };
+    });
+    if (adjustedCount === 0) return;
+    setClips(updated);
+    assetRevision.current++;
+    episodeChanged.current = true;
+    setRenderResult(null);
+    setPlayerMode('storyboard');
+    setRenderError(null);
+    setProgressNote(`Tightened ${adjustedCount} cue(s) to leave ~0.5–0.8s breathing pause between narrations.`);
   };
 
   const handleTranslateClip = async (clip: RecapClip) => {
@@ -520,6 +546,7 @@ export default function App() {
             onUpdateClip={handleUpdateClip}
             onShortenClip={handleShortenClip}
             onShortenAllLongClips={handleShortenAllLongClips}
+            onTightenAllGaps={handleTightenAllGaps}
             isShorteningAll={isShorteningAll}
             progressNote={progressNote}
             onTranslateClip={handleTranslateClip}

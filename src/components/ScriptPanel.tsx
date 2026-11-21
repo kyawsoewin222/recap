@@ -21,6 +21,7 @@ interface ScriptPanelProps {
   ) => void;
   onShortenClip: (clip: RecapClip) => Promise<void>;
   onShortenAllLongClips: () => Promise<void>;
+  onTightenAllGaps: () => void;
   isShorteningAll: boolean;
   progressNote: string | null;
   onTranslateClip: (clip: RecapClip) => Promise<void>;
@@ -100,6 +101,7 @@ export default function ScriptPanel({
   onUpdateClip,
   onShortenClip,
   onShortenAllLongClips,
+  onTightenAllGaps,
   isShorteningAll,
   progressNote,
   onTranslateClip,
@@ -114,6 +116,7 @@ export default function ScriptPanel({
     0
   );
   const longClipCount = clips.filter((c) => getClipPaceCheck(c).status === 'long').length;
+  const excessGapCount = clips.filter((c) => getClipPaceCheck(c).hasExcessGap).length;
 
   const handleCopyFullBurmese = async () => {
     const fullText = clips
@@ -151,6 +154,18 @@ export default function ScriptPanel({
           </div>
 
           <div className="flex items-center gap-2">
+            {excessGapCount > 0 && (
+              <button
+                type="button"
+                onClick={onTightenAllGaps}
+                disabled={busy}
+                className="h-9 px-3 inline-flex items-center gap-1.5 rounded-lg border border-sky-700/60 bg-sky-950/40 hover:bg-sky-900/50 text-sky-200 disabled:opacity-60 text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
+              >
+                <Scissors className="w-3.5 h-3.5" />
+                <span>Tighten {excessGapCount} Gaps</span>
+              </button>
+            )}
+
             {longClipCount > 0 && (
               <button
                 type="button"
@@ -227,14 +242,18 @@ export default function ScriptPanel({
                     className={`font-mono tabular-nums px-1.5 py-0.5 rounded text-[11px] ${
                       pace.status === 'long'
                         ? 'bg-rose-950/70 text-rose-300 border border-rose-800/60'
-                        : pace.status === 'tight'
-                          ? 'bg-amber-950/60 text-amber-300 border border-amber-800/50'
-                          : 'bg-emerald-950/60 text-emerald-300 border border-emerald-800/50'
+                        : pace.hasExcessGap
+                          ? 'bg-sky-950/70 text-sky-300 border border-sky-800/60'
+                          : pace.status === 'tight'
+                            ? 'bg-amber-950/60 text-amber-300 border border-amber-800/50'
+                            : 'bg-emerald-950/60 text-emerald-300 border border-emerald-800/50'
                     }`}
                   >
                     {pace.status === 'long'
                       ? `~${pace.estimatedSpeechSec.toFixed(1)}s speech (+${pace.overflowSec.toFixed(1)}s long)`
-                      : `~${pace.estimatedSpeechSec.toFixed(1)}s speech`}
+                      : pace.hasExcessGap
+                        ? `~${pace.estimatedSpeechSec.toFixed(1)}s speech (${pace.gapSec.toFixed(1)}s gap)`
+                        : `~${pace.estimatedSpeechSec.toFixed(1)}s speech`}
                   </span>
                 </div>
 

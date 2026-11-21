@@ -22,7 +22,7 @@ export function countGraphemes(text: string): number {
 
 /**
  * Estimates natural spoken Burmese narration duration (default Edge-TTS +0% pace).
- * Natural Burmese recap speech averages ~6.0 visible grapheme clusters/sec plus punctuation pauses.
+ * Measured Burmese Edge-TTS averages ~8.2 visible grapheme clusters/sec plus short punctuation pauses.
  */
 export function estimateBurmeseSpeechSec(text: string): number {
   const trimmed = text.trim();
@@ -30,7 +30,16 @@ export function estimateBurmeseSpeechSec(text: string): number {
   const graphemeCount = countGraphemes(trimmed);
   const punctuationMatches = trimmed.match(/[၊။!?,.;\n]/gu);
   const pauseCount = punctuationMatches ? punctuationMatches.length : 0;
-  return Number((0.25 + graphemeCount / 6.0 + pauseCount * 0.22).toFixed(2));
+  return Number((0.25 + graphemeCount / 8.2 + pauseCount * 0.15).toFixed(2));
+}
+
+/**
+ * Computes a tight 1.0x clip duration matching Burmese speech + a natural ~0.55s pause between cues.
+ */
+export function getTightClipDuration(text: string, pauseBetweenCuesSec = 0.55): number {
+  const speechSec = estimateBurmeseSpeechSec(text);
+  if (speechSec <= 0) return 2.5;
+  return Math.max(2.5, Number((speechSec + pauseBetweenCuesSec).toFixed(2)));
 }
 
 export function wrapBurmeseCueLines(text: string, maxLineGraphemes = 28): string {
@@ -60,6 +69,8 @@ export interface ClipPaceCheck {
   estimatedSpeechSec: number;
   graphemes: number;
   overflowSec: number;
+  gapSec: number;
+  hasExcessGap: boolean;
   status: 'fit' | 'tight' | 'long';
 }
 
@@ -70,13 +81,17 @@ export function getClipPaceCheck(
   const estimatedSpeechSec = estimateBurmeseSpeechSec(clip.burmeseScript);
   const graphemeCount = countGraphemes(clip.burmeseScript);
   const overflowSec = Number(Math.max(0, estimatedSpeechSec - videoDuration).toFixed(2));
+  const gapSec = Number(Math.max(0, videoDuration - estimatedSpeechSec).toFixed(2));
+  const hasExcessGap = gapSec > 1.8;
   const ratio = videoDuration > 0 ? estimatedSpeechSec / videoDuration : Infinity;
-  const status = ratio > 1.05 ? 'long' : ratio > 0.88 ? 'tight' : 'fit';
+  const status = ratio > 1.02 ? 'long' : ratio > 0.88 ? 'tight' : 'fit';
   return {
     videoDuration,
     estimatedSpeechSec,
     graphemes: graphemeCount,
     overflowSec,
+    gapSec,
+    hasExcessGap,
     status,
   };
 }

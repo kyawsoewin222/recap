@@ -9,7 +9,7 @@ import path from 'path';
 import { promisify } from 'util';
 import { createServer as createViteServer } from 'vite';
 import { buildSrtFromClips, parseSrt } from './src/data/srt.ts';
-import { estimateBurmeseSpeechSec, getSegmentTiming, wrapBurmeseCueLines } from './src/data/timing.ts';
+import { estimateBurmeseSpeechSec, getSegmentTiming, getTightClipDuration, wrapBurmeseCueLines } from './src/data/timing.ts';
 import { alignedSubtitleCues } from './src/data/alignment.ts';
 
 dotenv.config();
@@ -478,7 +478,7 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
 
       const durHint =
         typeof videoDuration === 'number' && Number.isFinite(videoDuration) && videoDuration > 0
-          ? `Fit comfortably within ${videoDuration.toFixed(1)} seconds at natural 1.0x speaking speed (target ~${Math.max(15, Math.floor((videoDuration - 0.3) * 5.8))} Burmese characters/graphemes max, 1–2 short easy-to-read subtitle lines).`
+          ? `Fit comfortably within ${videoDuration.toFixed(1)} seconds at natural 1.0x speaking speed (target ~${Math.max(18, Math.floor((videoDuration - 0.55) * 7.8))} Burmese characters/graphemes, 1–2 short easy-to-read subtitle lines).`
           : 'Keep it concise (1–2 short, easy-to-read subtitle lines).';
 
       const ai = getAiClient();
@@ -520,7 +520,7 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
         return;
       }
       const videoDuration = Math.max(1.5, Number(sourceEnd) - Number(sourceStart) || 5);
-      const targetGraphemes = Math.max(16, Math.floor((videoDuration - 0.35) * 5.6));
+      const targetGraphemes = Math.max(18, Math.floor((videoDuration - 0.55) * 7.8));
 
       const ai = getAiClient();
       const response = await withGeminiRetry(() =>
@@ -639,8 +639,8 @@ Rules:
 1. Do NOT copy or translate spoken/subtitle dialogue word-for-word. Tell the story in original spoken Burmese recap style for copyright safety.
 2. Preserve full plot meaning chronologically: keep character identities, actions, motivations, cause and effect, key dialogue meaning, reveals, and outcomes without inventing facts. Skip only dead pauses or repetitive filler—a 10–15 minute episode should naturally condense to ~5–8 minutes (or shorter if plot density is light).
 3. Use natural, conversational spoken Burmese storytelling (engaging, easy for viewers to follow—NOT stiff textbook paragraphs).
-4. Keep every clip's burmeseScript short and easy to read on screen (1 crisp sentence, roughly 20–45 Burmese characters/graphemes, max 1–2 subtitle lines).
-5. IMPORTANT — Expand video time for explanations at 1.0x speed: Each clip plays at strict 1.0x speed with NO speed-up or slow-down. Always make (sourceEnd - sourceStart) long enough for a narrator speaking at natural speed (~5.5–6 Burmese graphemes/sec) to finish comfortably. If an explanation needs more time, expand sourceEnd further within the scene (e.g. 7–14 seconds) or split the beat into two sequential chronological clips (never cram a long paragraph into a 4-second clip).
+4. Keep every clip's burmeseScript natural and easy to read on screen (1–2 crisp spoken sentences, roughly 28–60 Burmese characters/graphemes, max 1–2 subtitle lines).
+5. IMPORTANT — Keep narrator pacing tight with minimal pause between cues (1.0x speed): Edge-TTS speaks Burmese at ~8 Burmese graphemes/sec. Keep (sourceEnd - sourceStart) tightly matched to the narration duration PLUS only 0.4–0.8 seconds of breathing pause before the next cue (typically 4–8 seconds per clip—NEVER leave 3–10 seconds of dead silence after a sentence finishes!). Only make a clip 8–11 seconds long when the burmeseScript itself takes ~7.5–10 seconds to narrate; otherwise trim sourceEnd tightly around the key visual beat so the narrator flows naturally from cue to cue.
 6. Provide accurate, strictly chronological, non-overlapping timestamps relative to THIS video clip (0 to ${chunk.durationSec.toFixed(1)}), with sourceEnd >= sourceStart + 2.5 and targetDuration = sourceEnd - sourceStart.
 7. Return burmeseScript (Myanmar Unicode), concise englishScript summary, and a short 2–4 word title.`;
 
@@ -703,8 +703,14 @@ Rules:
           for (const item of parsed) {
             const rawStart = Math.max(prevRelEnd, Number(item.sourceStart) || 0);
             if (rawStart >= chunk.durationSec - 1.2) continue;
+            const burmeseScript = String(item.burmeseScript || '').trim();
             const relStart = Math.max(0, Math.min(chunk.durationSec - 1.5, rawStart));
-            const relEnd = Math.max(relStart + 1.2, Math.min(chunk.durationSec, Number(item.sourceEnd) || relStart + 5));
+            const rawRelEnd = Math.max(relStart + 1.2, Math.min(chunk.durationSec, Number(item.sourceEnd) || relStart + 5));
+            const tightDur = getTightClipDuration(burmeseScript);
+            const relEnd =
+              rawRelEnd - relStart > tightDur + 1.0
+                ? Math.min(chunk.durationSec, Number((relStart + tightDur).toFixed(2)))
+                : rawRelEnd;
             prevRelEnd = relEnd;
             const spanDur = relEnd - relStart;
             allClips.push({
@@ -714,7 +720,7 @@ Rules:
               sourceEnd: Number((chunk.offsetSec + relEnd).toFixed(2)),
               targetDuration: Number(spanDur.toFixed(2)),
               englishScript: String(item.englishScript || '').trim(),
-              burmeseScript: String(item.burmeseScript || '').trim(),
+              burmeseScript,
             });
             nextId++;
           }
