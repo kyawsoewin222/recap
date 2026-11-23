@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 from checkpoint_store import get_job_dir
-from edge_tts_service import generate_edge_tts
 from gemini_script_service import generate_resumable_recap_plan
 from models import RecapClip
 from video_renderer import render_16x9_recap
@@ -39,42 +38,13 @@ async def run_pipeline(args: argparse.Namespace) -> None:
     )
     print(f"Saved {len(raw_clips)} clips to {job_dir / 'script.json'}")
 
-    clips: list[RecapClip] = []
-    if args.video_only:
-        print("=== Step 2: Skipping Edge TTS (--video-only mode) ===")
-        for c in raw_clips:
-            clips.append(
-                RecapClip(
-                    id=c["id"],
-                    source_start=c["source_start"],
-                    source_end=c["source_end"],
-                    target_duration=9.0,
-                    english_script=c["english_script"],
-                    burmese_script=c["burmese_script"],
-                    audio_path=None,
-                )
-            )
-    else:
-        print(f"=== Step 2: Generating Edge TTS ({args.voice}, rate={args.rate}) ===")
-        for c in raw_clips:
-            mp3_path, dur = await generate_edge_tts(
-                clip_id=c["id"],
-                text=c["burmese_script"],
-                voice_name=args.voice,
-                rate=args.rate,
-            )
-            print(f"  Clip {c['id']:02d}: {dur:.2f}s -> {mp3_path.name}")
-            clips.append(
-                RecapClip(
-                    id=c["id"],
-                    source_start=c["source_start"],
-                    source_end=c["source_end"],
-                    target_duration=dur + 0.4,
-                    english_script=c["english_script"],
-                    burmese_script=c["burmese_script"],
-                    audio_path=str(mp3_path),
-                )
-            )
+    clips = [
+        RecapClip(
+            id=c["id"], source_start=c["source_start"], source_end=c["source_end"],
+            english_script=c["english_script"], burmese_script=c["burmese_script"],
+        )
+        for c in raw_clips
+    ]
 
     print("=== Step 3: Rendering 16:9 MP4 + Burmese Subtitles ===")
     result = render_16x9_recap(
@@ -84,9 +54,6 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         include_subtitles=not args.no_subtitles,
         mask_bottom_subtitles=not args.no_mask,
         original_audio_volume=args.orig_vol,
-        voiceover_volume=args.vo_vol,
-        auto_duck_original_audio=not args.no_duck,
-        video_only=args.video_only,
     )
 
     print("\n=== DONE ===")
@@ -106,12 +73,7 @@ def main() -> None:
     parser.add_argument("--delay", type=float, default=25.0, help="Seconds between chunks")
     parser.add_argument("--full-res-upload", action="store_true")
     parser.add_argument("--strip-audio", action="store_true", help="Strip audio from Gemini upload proxy to save ~50% tokens")
-    parser.add_argument("--voice", default="my-MM-ThihaNeural", choices=["my-MM-ThihaNeural", "my-MM-NilarNeural"])
-    parser.add_argument("--rate", default="+0%")
-    parser.add_argument("--video-only", action="store_true", help="Skip TTS and export video + original audio + script only")
-    parser.add_argument("--orig-vol", type=float, default=0.35, help="Original video audio volume (0.0 - 1.5)")
-    parser.add_argument("--vo-vol", type=float, default=1.15, help="Edge TTS voiceover volume")
-    parser.add_argument("--no-duck", action="store_true", help="Disable sidechain auto-ducking of original audio")
+    parser.add_argument("--orig-vol", type=float, default=1.0, help="Original video audio volume (0.0 - 1.5)")
     parser.add_argument("--no-subtitles", action="store_true", help="Do not burn in Burmese subtitles")
     parser.add_argument("--no-mask", action="store_true", help="Do not draw bottom dark scrim")
     args = parser.parse_args()

@@ -1,3 +1,5 @@
+> Historical note: this document describes an earlier voice-generation workflow. Voice generation has since been removed from this project; exported SRT cues follow selected scene durations.
+
 # Isolated narration, timing and subtitle repair
 
 Prior local changes are committed on `main` at `997c736`, with rollback tag `recap-before-timing-fix-20261120`. The repair is isolated on `fix/recap-narration-timing`. To return to the preserved application after stopping the development server, use `git switch main`; no reset or clean is necessary. Keep any subsequent work committed before switching. Generated runtime files are ignored and do not change the checkpoint.

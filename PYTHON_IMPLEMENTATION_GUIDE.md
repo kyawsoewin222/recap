@@ -1,12 +1,12 @@
 # 16:9 Burmese Movie Recap Pipeline — Step-by-Step Implementation Spec (For Codex)
 
-Implement a resumable Python pipeline that converts any short clip or **2-hour movie** into a fast-paced **16:9 (1280×720)** Burmese movie recap video using **Gemini (`gemini-4-hydrogen`)** for video analysis/scripting, **`edge-tts`** for free Burmese narration, and **FFmpeg + `libass`** for rendering with original movie audio preserved.
+Implement a resumable Python pipeline that converts any short clip or **2-hour movie** into a fast-paced **16:9 (1280×720)** Burmese movie recap video using **Gemini (`gemini-4-hydrogen`)** for video analysis/scripting, **FFmpeg + `libass`** for rendering with original movie audio preserved.
 
 ---
 
 ## Target Tech Stack & System Requirements
 
-- **Python Packages**: `google-genai`, `edge-tts`, `pydantic`, `fastapi`, `uvicorn`
+- **Python Packages**: `google-genai`, `pydantic`, `fastapi`, `uvicorn`
 - **System Tools**: `ffmpeg`, `ffprobe` (compiled with `libx264`, `aac`, and `libass`), plus `Noto Sans Myanmar` font (`fonts-noto-core` / `fonts-noto-extra`)
 - **Environment Variable**: `GEMINI_API_KEY` (used only for Gemini video-to-script analysis)
 
@@ -22,7 +22,6 @@ Create deterministic per-video job folders under `storage/jobs/{job_id}/`:
   - `target_duration: float` (default `4.5`)
   - `english_script: str` (original 3–5s single-sentence summary, ~10–14 words max, no copied dialogue)
   - `burmese_script: str` (natural fast-paced spoken Burmese)
-  - `audio_path: Optional[str]`
 
 ---
 
@@ -67,32 +66,8 @@ Split `total_duration_sec` into **20-minute windows** (`chunk_minutes=20`, e.g.,
 
 ---
 
-## Step 5: Burmese Voiceover Generation (`edge-tts`)
-1. Support native Myanmar neural voices: `my-MM-ThihaNeural` (male) and `my-MM-NilarNeural` (female), with fast recap pacing (`rate="+12%"`).
-2. Cache each generated `.mp3` in `storage/tts/` using `sha1(voice:rate:text)[:12]`. Skip existing valid files on resume and retry transient network failures with exponential backoff.
-3. Probe each `.mp3` with `ffprobe` to get exact spoken duration (`tts_dur`).
-4. Support a `--video-only` / no-narrator flag that skips TTS synthesis and keeps `audio_path=None`.
-
----
-
-## Step 6: Resumable 16:9 FFmpeg Renderer with Original Audio ON
-Render each clip segment into `storage/jobs/{job_id}/render_cache/segments/seg-{idx:03d}.mp4`:
-1. **Segment Checkpoint**: If `seg-{idx:03d}.mp4` already exists (`>10KB`), skip re-rendering it and accumulate its probed duration for subtitle timing.
-2. **Duration & Speed Sync**:
-   - If `audio_path` exists: `clip_duration = clamp(tts_dur + 0.25, 2.5, 14.0)`.
-   - Otherwise: use `target_duration` (`>= 2.5s`).
-   - Compute `speed_ratio = clip_duration / (source_end - source_start)` and apply `setpts={speed_ratio}*PTS`.
-3. **16:9 Framing & Old Subtitle Masking**:
-   - Video filter chain: `scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=25,setpts=...`
-   - If `mask_bottom_subtitles=True`, append `drawbox=x=0:y=592:w=1280:h=128:color=black@0.82:t=fill` to cover hardcoded subtitles on the source video.
-4. **Original Audio ON + Auto-Ducking**:
-   - Normalize source audio (`[0:a]`): apply `atempo={1/speed_ratio}` only when `0.5 <= tempo <= 2.0`, set `volume=original_audio_volume` (e.g., `0.35` with narrator or `1.0` in video-only mode), resample to `48000Hz stereo`, and `apad` + `atrim` to `clip_duration`.
-   - If narrator `.mp3` (`[1:a]`) is present:
-     - Normalize `[1:a]` to `48000Hz stereo`, `apad` + `atrim` to `clip_duration`.
-     - If `auto_duck_original_audio=True`: split `[vo_raw]` and run `[bg][vo_sc]sidechaincompress=threshold=0.02:ratio=6:attack=25:release=350[bg_ducked]` before `amix=inputs=2:duration=first:normalize=0`.
-     - Otherwise blend directly with `amix`.
-   - Write atomically to `seg-{idx:03d}.tmp.mp4` then rename to `seg-{idx:03d}.mp4`.
-5. **Concatenate**: Merge all segments via FFmpeg `concat` demuxer (`-f concat -safe 0 -c copy`).
+## Step 5: Render recap video and SRT
+Render selected source ranges at their original duration. Keep the original audio at the configured volume and generate scene-timed Burmese SRT cues. Optionally mask existing subtitles or burn in the new subtitles. Voice generation is handled outside this project.
 
 ---
 
@@ -100,11 +75,11 @@ Render each clip segment into `storage/jobs/{job_id}/render_cache/segments/seg-{
 1. Generate `.srt` and `.ass` subtitle files using cumulative segment durations.
 2. **Critical Myanmar Shaping Rule**: Do **not** use FFmpeg's `drawtext` filter (it breaks Burmese vowel reordering and stacked consonants). Always use FFmpeg's `ass` filter (`libass` + HarfBuzz) with `Fontname=Noto Sans Myanmar`, `PlayResX=1280`, `PlayResY=720`, `WrapStyle=0`, `Alignment=2`.
 3. Run FFmpeg with `cwd=work_dir` and `-vf ass=subtitles.ass` (avoiding path-escaping issues), encoding final output with `libx264 -pix_fmt yuv420p -c:a copy -movflags +faststart`.
-4. Expose both a CLI runner (`run_recap.py`) and FastAPI routes (`/api/plan`, `/api/jobs/{job_id}`, `/api/tts`, `/api/render`).
+4. Expose both a CLI runner (`run_recap.py`) and FastAPI routes (`/api/plan`, `/api/jobs/{job_id}`, `/api/render`).
 
 ---
 
 ## Verification Checklist for Codex
-- Verify `ffmpeg -filters` includes `ass` and `sidechaincompress`, and `fc-list :lang=my` returns `Noto Sans Myanmar`.
+- Verify `ffmpeg -filters` includes `ass`, and `fc-list :lang=my` returns `Noto Sans Myanmar`.
 - Test interrupting `/api/plan` or CLI mid-run (e.g., simulated `429` or Ctrl+C after chunk 1) and verify re-running skips chunk 0 and resumes at chunk 1 without re-uploading the video.
-- Verify output `.mp4` is `1280x720` (16:9), Burmese subtitles render without broken/box glyphs, and original video audio ducks cleanly during narration.
+- Verify output `.mp4` is `1280x720` (16:9), Burmese subtitles render without broken/box glyphs, and original video audio is preserved.

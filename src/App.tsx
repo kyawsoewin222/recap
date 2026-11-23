@@ -1,5 +1,5 @@
 import { Upload } from 'lucide-react';
-import { useEffect, useRef, useState, type ChangeEvent } from 'react';
+import { useRef, useState, type ChangeEvent } from 'react';
 import RecapPlayer, { type SubtitleMode } from './components/RecapPlayer';
 import ScriptPanel from './components/ScriptPanel';
 import { getClipPaceCheck, getTightClipDuration } from './data/timing';
@@ -12,7 +12,6 @@ import {
 
 export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const episodeChanged = useRef(false);
   const assetRevision = useRef(0);
   const [scriptSource, setScriptSource] = useState<'gemini' | 'srt'>('gemini');
   const [activeScriptSource, setActiveScriptSource] = useState<'gemini' | 'srt'>('gemini');
@@ -27,7 +26,7 @@ export default function App() {
   const [subtitleMode, setSubtitleMode] = useState<SubtitleMode>('burmese');
   const [burnSubtitles, setBurnSubtitles] = useState(false);
   const [maskBottomSubtitles, setMaskBottomSubtitles] = useState(false);
-  const [sourceAudioVolume, setSourceAudioVolume] = useState(0);
+  const [sourceAudioVolume, setSourceAudioVolume] = useState(1);
   const [uploadStatusText, setUploadStatusText] = useState<string | null>(null);
   const [isProcessingEpisode, setIsProcessingEpisode] = useState(false);
 
@@ -43,18 +42,6 @@ export default function App() {
     'storyboard'
   );
   const busy = isProcessingEpisode || isRendering || isShorteningAll || busyClipId !== null;
-
-  useEffect(() => {
-    fetch('/api/default-render')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data: RenderResult | null) => {
-        if (data?.videoUrl && !episodeChanged.current) {
-          setRenderResult(data);
-          setPlayerMode('rendered');
-        }
-      })
-      .catch(() => {});
-  }, []);
 
   const handleUpdateClip = (
     clipId: number,
@@ -86,7 +73,6 @@ export default function App() {
 
     setClips(updated);
     assetRevision.current++;
-    episodeChanged.current = true;
     setClipErrorMap((prev) => {
       if (!(clipId in prev)) return prev;
       const copy = { ...prev };
@@ -161,7 +147,6 @@ export default function App() {
         );
         setClips(currentClips);
         assetRevision.current++;
-        episodeChanged.current = true;
       }
       setRenderResult(null);
       setPlayerMode('storyboard');
@@ -192,7 +177,6 @@ export default function App() {
     if (adjustedCount === 0) return;
     setClips(updated);
     assetRevision.current++;
-    episodeChanged.current = true;
     setRenderResult(null);
     setPlayerMode('storyboard');
     setRenderError(null);
@@ -253,12 +237,10 @@ export default function App() {
         body: JSON.stringify({
           clips: payloadClips,
           scriptSource: activeScriptSource,
-          videoOnly: true,
           sample,
           sourceVideoUrl,
           includeSubtitles: burnSubtitles,
           maskBottomSubtitles,
-          sourceAudioVolume,
         }),
       });
 
@@ -350,7 +332,6 @@ export default function App() {
       }
 
       const generatedClips: RecapClip[] = analyzeData.clips;
-      episodeChanged.current = true;
       assetRevision.current++;
       if (file) {
         const cleanTitle = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ');
@@ -367,8 +348,8 @@ export default function App() {
       const longCount = generatedClips.filter((c) => getClipPaceCheck(c).status === 'long').length;
       setProgressNote(
         longCount > 0
-          ? `${longCount} cue(s) look longer than their 1.0x clip window — use "Shorten Long Cues" or widen Source end before exporting.`
-          : 'All cues fit cleanly at 1.0x speed. Review the storyboard and export MP4 + SRT.'
+          ? `${longCount} cue(s) may need more time for narration. Review the story and scene ranges before export.`
+          : 'Review the story and scene ranges before exporting the silent MP4 and Burmese SRT.'
       );
     } catch (err: unknown) {
       const message =
@@ -463,12 +444,13 @@ export default function App() {
                 setSrtFile(null);
               }}
             >
-              <option value="gemini">Generate with Gemini (1.0x Video + SRT)</option>
+              <option value="gemini">Generate recap with Gemini</option>
               <option value="srt">Import existing SRT file</option>
             </select>
           </label>
           {scriptSource === 'srt' && (
             <>
+              <p className="text-xs text-slate-400">SRT timestamps select ranges in the source video.</p>
               <label className="flex flex-col gap-1 text-xs text-slate-400">
                 Narration SRT
                 <input
@@ -508,7 +490,7 @@ export default function App() {
               {episodeTitle}
             </h1>
             <p className="text-sm text-slate-400 mt-1">
-              {clips.length} {activeScriptSource === 'srt' ? 'SRT cues' : 'storytelling beats'} · 16:9 (1280×720) · 1.0x native speed
+              {clips.length} {activeScriptSource === 'srt' ? 'SRT cues' : 'storytelling beats'} · Estimated recap: {clips.reduce((sum, clip) => sum + clip.sourceEnd - clip.sourceStart, 0).toFixed(1)}s · Silent MP4 + Burmese SRT
             </p>
           </div>
         </div>

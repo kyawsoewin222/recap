@@ -375,7 +375,7 @@ export default function RecapPlayer({
               </button>
             </div>
 
-            {/* Volume controls (default 0% muted for local music + Edge-TTS) */}
+            {/* Original audio controls */}
             <div className="flex flex-wrap items-center gap-4">
               <div className="flex items-center gap-2">
                 <button
@@ -391,7 +391,7 @@ export default function RecapPlayer({
                   )}
                 </button>
                 <label className="flex items-center gap-2 text-xs text-slate-400">
-                  <span className="whitespace-nowrap">Original Audio</span>
+                  <span className="whitespace-nowrap">Preview audio only</span>
                   <input
                     type="range"
                     min={0}
@@ -517,7 +517,7 @@ export default function RecapPlayer({
       >
         <div className="flex flex-col gap-1">
           <h2 className="text-sm font-semibold text-white">
-            16:9 Recap MP4 + Synced SRT Export
+            Silent 16:9 Recap MP4 + Burmese SRT
           </h2>
           {renderError ? (
             <p className="text-xs text-rose-400">{renderError}</p>
@@ -531,8 +531,7 @@ export default function RecapPlayer({
             </p>
           ) : (
             <p className="text-xs text-slate-400">
-              Exports all {clips.length} cuts at 1.0x speed ({sourceAudioVolume === 0 ? 'muted audio' : `${Math.round(sourceAudioVolume * 100)}% audio`},{' '}
-              {burnSubtitles ? 'burned subtitles' : 'clean video'}) + matching .SRT cues.
+              Exports all {clips.length} cuts without audio ({burnSubtitles ? 'burned subtitles' : 'clean video'}) + Burmese SRT timed to the recap video.
             </p>
           )}
         </div>

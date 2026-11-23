@@ -1,6 +1,6 @@
 {
   "name": "RecapCut Studio",
-  "description": "Create fast-paced 16:9 Burmese movie recap videos with AI voiceover narration, burned-in Myanmar subtitles, and MP4 export.",
+  "description": "Create fast-paced 16:9 Burmese movie recap videos with Myanmar subtitles, SRT files, and MP4 export.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -9,7 +9,6 @@ class RecapClip(BaseModel):
     target_duration: float = 9.0
     english_script: str
     burmese_script: str
-    audio_path: Optional[str] = None
 
 
 class GeneratePlanRequest(BaseModel):
@@ -22,20 +21,10 @@ class GeneratePlanRequest(BaseModel):
     free_tier_delay_sec: float = 25.0
 
 
-class EdgeTTSRequest(BaseModel):
-    clip_id: int
-    text: str
-    voice_name: str = "my-MM-ThihaNeural"  # or "my-MM-NilarNeural"
-    rate: str = "+0%"
-
-
 class RenderRequest(BaseModel):
-    video_only: bool = False
     source_video_path: str
     clips: list[RecapClip]
     job_id: Optional[str] = None
     include_subtitles: bool = True
     mask_bottom_subtitles: bool = True
-    original_audio_volume: float = 0.35
-    voiceover_volume: float = 1.15
-    auto_duck_original_audio: bool = True
+    original_audio_volume: float = 1.0

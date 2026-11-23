@@ -1,19 +1,31 @@
 import re
-import json
 import math
 import tempfile
-import warnings
 import subprocess
 import time
 from pathlib import Path
 
 from checkpoint_store import build_job_id, get_job_dir
-from edge_tts_service import probe_duration
 from models import RecapClip
-from timing import narration_timing, subtitle_cues
+from timing import approximate_subtitles
 
 RENDERS_DIR = Path("storage/renders")
 RENDERS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def probe_duration(file_path: str | Path) -> float:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)],
+        capture_output=True, text=True, check=True,
+    )
+    try:
+        duration = float(result.stdout.strip())
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("duration must be finite and positive")
+        return duration
+    except ValueError as exc:
+        raise ValueError(f"Could not measure audio/video duration: {file_path}") from exc
 
 
 def format_ass_time(seconds: float) -> str:
@@ -51,10 +63,7 @@ def render_16x9_recap(
     job_id: str | None = None,
     include_subtitles: bool = True,
     mask_bottom_subtitles: bool = True,
-    original_audio_volume: float = 0.35,
-    voiceover_volume: float = 1.15,
-    auto_duck_original_audio: bool = True,
-    video_only: bool = False,
+    original_audio_volume: float = 1.0,
 ) -> dict:
     src_path = Path(source_video_path)
     if not src_path.exists():
@@ -73,7 +82,6 @@ def render_16x9_recap(
     cumulative_time = 0.0
 
     planned_segments = []
-    timing_modes = set()
     previous_end = 0.0
     source_duration = probe_duration(src_path)
     for clip in clips:
@@ -82,46 +90,24 @@ def render_16x9_recap(
                 clip.source_end > source_duration):
             raise ValueError(f"Clip {clip.id}: source range overlaps or is outside the source video.")
         previous_end = clip.source_end
-        local_audio = Path(clip.audio_path) if clip.audio_path else None
-        if local_audio is None or not local_audio.is_file():
-            if not video_only:
-                raise ValueError(f"Clip {clip.id}: narration is missing. Generate audio before rendering.")
-            duration = clip.source_end - clip.source_start
-            if duration <= 0:
-                raise ValueError(f"Clip {clip.id}: source end must follow source start.")
-            planned_segments.append((clip, None, duration, 1.0, []))
-            continue
-        metadata_path = local_audio.with_suffix(".json")
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
-        if metadata.get("text") != clip.burmese_script.strip():
-            raise ValueError(f"Clip {clip.id}: narration changed or audio is unverified. Regenerate narration.")
-        audio_duration = probe_duration(local_audio)
-        try:
-            duration, speed = narration_timing(clip.source_start, clip.source_end, audio_duration)
-        except ValueError as exc:
-            raise ValueError(f"Clip {clip.id}: {exc}") from exc
-        cues, timing_mode = subtitle_cues(clip.burmese_script, audio_duration, metadata.get("boundaries", []))
-        timing_modes.add(timing_mode)
-        planned_segments.append((clip, local_audio, duration, speed, cues))
-    if "approximate" in timing_modes:
-        warnings.warn("Subtitle phrase timing is approximate, based on text length, not speech alignment; review the sample.", stacklevel=2)
+        duration = clip.source_end - clip.source_start
+        cues = approximate_subtitles(clip.burmese_script, duration)
+        planned_segments.append((clip, duration, cues))
 
     if include_subtitles:
         filters = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, check=True)
         if not re.search(r"\bass\s+V->V", filters.stdout):
             raise RuntimeError("Burned-in subtitles need FFmpeg with libass. Install a libass-enabled FFmpeg or render with --no-subtitles / include_subtitles=false; the SRT will still be exported.")
 
-    for idx, (clip, local_audio, clip_duration, speed, cues) in enumerate(planned_segments):
+    for idx, (clip, clip_duration, cues) in enumerate(planned_segments):
         src_start = clip.source_start
         raw_src_dur = clip.source_end - src_start
         seg_out = seg_dir / f"seg-{idx:03d}.mp4"
         seg_tmp = seg_dir / f"seg-{idx:03d}.tmp.mp4"
-        speed_ratio = 1.0 / speed
         video_filters = [
             "scale=1280:720:force_original_aspect_ratio=increase",
             "crop=1280:720",
             "fps=25",
-            f"setpts={speed_ratio:.6f}*PTS",
         ]
         if mask_bottom_subtitles:
             video_filters.append(
@@ -134,47 +120,12 @@ def render_16x9_recap(
             "-t", f"{raw_src_dur:.3f}",
             "-i", str(src_path),
         ]
-        if local_audio:
-            args.extend(["-i", str(local_audio)])
-
         bg_vol = max(0.0, min(1.5, original_audio_volume))
-        vo_vol = max(0.0, min(2.0, voiceover_volume))
-        tempo = 1.0 / speed_ratio
-
-        filter_parts = [f"[0:v]{','.join(video_filters)}[vout]"]
-
-        bg_filters = []
-        if 0.5 <= tempo <= 2.0:
-            bg_filters.append(f"atempo={tempo:.4f}")
-        bg_filters.extend([
-            f"volume={bg_vol:.2f}",
-            "aformat=sample_rates=48000:channel_layouts=stereo",
-            f"apad=whole_dur={clip_duration:.3f}",
-            f"atrim=duration={clip_duration:.3f}",
-        ])
-
-        if local_audio:
-            filter_parts.append(f"[0:a]{','.join(bg_filters)}[bg]")
-            filter_parts.append(
-                f"[1:a]volume={vo_vol:.2f},"
-                "aformat=sample_rates=48000:channel_layouts=stereo,"
-                f"apad=whole_dur={clip_duration:.3f},"
-                f"atrim=duration={clip_duration:.3f}[vo_raw]"
-            )
-            if auto_duck_original_audio:
-                filter_parts.append("[vo_raw]asplit=2[vo_sc][vo_mix]")
-                filter_parts.append(
-                    "[bg][vo_sc]sidechaincompress=threshold=0.02:ratio=6:attack=25:release=350[bg_ducked]"
-                )
-                filter_parts.append(
-                    "[bg_ducked][vo_mix]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
-                )
-            else:
-                filter_parts.append(
-                    "[bg][vo_raw]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
-                )
-        else:
-            filter_parts.append(f"[0:a]{','.join(bg_filters)}[aout]")
+        filter_parts = [
+            f"[0:v]{','.join(video_filters)}[vout]",
+            f"[0:a]volume={bg_vol:.2f},aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"apad=whole_dur={clip_duration:.3f},atrim=duration={clip_duration:.3f}[aout]",
+        ]
 
         args.extend([
             "-filter_complex", ";".join(filter_parts),
@@ -198,15 +149,12 @@ def render_16x9_recap(
             (cumulative_time + start, cumulative_time + end, text)
             for start, end, text in cues
         )
-        actual_duration = probe_duration(seg_out)
-        if local_audio and actual_duration < clip_duration - 0.1:
-            raise RuntimeError(f"Clip {clip.id}: rendered segment is shorter than the narration plan; review the source range.")
         cumulative_time += clip_duration
 
     concat_list = work_dir / "concat.txt"
     concat_list.write_text(
         "\n".join(
-            f"file '{segment.resolve().as_posix()}'\nduration {planned[2]:.6f}"
+            f"file '{segment.resolve().as_posix()}'\nduration {planned[1]:.6f}"
             for segment, planned in zip(segment_paths, planned_segments)
         ),
         encoding="utf-8",
@@ -303,6 +251,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         "file_size_bytes": final_mp4.stat().st_size,
         "width": 1280,
         "height": 720,
-        "subtitle_timing": "approximate" if "approximate" in timing_modes else "tts-boundaries" if timing_modes else "none",
-        "warnings": ["Subtitles use approximate phrase timing; review against the spoken audio."] if "approximate" in timing_modes else [],
+        "subtitle_timing": "approximate",
+        "warnings": ["Subtitle timing is estimated from clip duration; review before use."],
     }

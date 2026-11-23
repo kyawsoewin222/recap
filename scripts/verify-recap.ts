@@ -1,62 +1,70 @@
 // Run against npm run dev: npx tsx scripts/verify-recap.ts
 import assert from 'node:assert/strict';
-import fs from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
-import { getSegmentTiming } from '../src/data/timing.ts';
-import { alignedSubtitleCues } from '../src/data/alignment.ts';
+import fs from 'node:fs/promises';
+import { promisify } from 'node:util';
+import { parseSrt } from '../src/data/srt.ts';
 
-const directory = 'sample-output/timing-review';
-const metadata = JSON.parse(await fs.readFile(`${directory}/narration.json`, 'utf8'));
-const hash = crypto.createHash('sha1').update(`my-MM-ThihaNeural:+0%:${metadata.text}`).digest('hex').slice(0, 12);
-const audio = `clip-1-${hash}.mp3`;
-await fs.mkdir('public/tts', { recursive: true });
-await fs.mkdir('public/uploads', { recursive: true });
-await fs.copyFile(`${directory}/narration.mp3`, `public/tts/${audio}`);
-await fs.copyFile(`${directory}/narration.json`, `public/tts/${audio.replace('.mp3', '.json')}`);
-await fs.copyFile(`${directory}/source.mp4`, 'public/uploads/timing-review-source.mp4');
-const clip = { id: 1, sourceStart: 0, sourceEnd: 6.2, targetDuration: 4, burmeseScript: metadata.text, audioUrl: `/tts/${audio}` };
-const payload = { clips: [clip], sourceVideoUrl: '/uploads/timing-review-source.mp4', scriptSource: 'srt', includeSubtitles: false, sourceAudioVolume: 0.14, sample: true };
-async function render(body: unknown) {
-  const response = await fetch('http://localhost:3000/api/render', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  return { ok: response.ok, data: await response.json() };
+const execFileAsync = promisify(execFile);
+const source = `verify-recap-${crypto.randomUUID()}.mp4`;
+const files = [`public/uploads/${source}`];
+const clips = [
+  { id: 1, sourceStart: 0.12, sourceEnd: 1.35, burmeseScript: 'မင်္ဂလာပါ။' },
+  { id: 2, sourceStart: 2.1, sourceEnd: 3.73, burmeseScript: 'ဇာတ်လမ်း ဆက်ပါမည်။' },
+  { id: 3, sourceStart: 4.2, sourceEnd: 6, burmeseScript: 'ဇာတ်လမ်း ပြီးပါပြီ။' },
+];
+
+async function render(renderClips: typeof clips, scriptSource = 'gemini') {
+  const response = await fetch('http://localhost:3000/api/render', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clips: renderClips, sourceVideoUrl: `/uploads/${source}`, scriptSource, sourceAudioVolume: 1, sample: true }),
+  });
+  const result = await response.json();
+  if (response.ok) files.push('public' + result.videoUrl, 'public' + result.srtUrl);
+  return { response, result };
 }
-for (const [name, badClip, expected] of [
-  ['missing audio', { ...clip, audioUrl: undefined }, /generated narration/],
-  ['stale text', { ...clip, burmeseScript: clip.burmeseScript + ' အဆုံး။' }, /Regenerate/],
-  ['long narration in short footage', { ...clip, sourceEnd: 1 }, /needs review/],
-] as const) {
-  const result = await render({ ...payload, clips: [badClip] });
-  assert.equal(result.ok, false, name);
-  assert.match(result.data.error, expected, name);
-}
-const expected = getSegmentTiming(clip, metadata.duration_sec).duration;
-for (const source of ['srt', 'gemini']) {
-  const result = await render({ ...payload, scriptSource: source });
-  assert.equal(result.ok, true, JSON.stringify(result.data));
-  assert.ok(Math.abs(result.data.durationSec - expected) < 0.05, 'preview/export duration within one frame plus AAC rounding');
-  assert.equal(result.data.subtitleTiming, 'aligned');
-  const srt = await fs.readFile('public' + result.data.srtUrl, 'utf8');
-  const cues = alignedSubtitleCues(metadata.text, metadata.duration_sec, metadata.boundaries).subtitleCues;
-  assert.equal(srt.trim().split(/\n\s*\n/).length, cues.length);
-  assert.ok(srt.includes(cues[0].burmese));
-  if (source === 'srt') {
-    await fs.copyFile('public' + result.data.videoUrl, `${directory}/sample.mp4`);
-    await fs.copyFile('public' + result.data.srtUrl, `${directory}/sample.srt`);
-    await fs.writeFile(`${directory}/result.json`, JSON.stringify(result.data, null, 2));
+
+try {
+  await fs.mkdir('public/uploads', { recursive: true });
+  await fs.copyFile('sample-output/timing-review/source.mp4', files[0]);
+  const durations: number[] = [];
+  for (const clip of clips) {
+    const { response, result } = await render([clip]);
+    assert.equal(response.ok, true, JSON.stringify(result));
+    durations.push(result.durationSec);
   }
+
+  for (const scriptSource of ['srt', 'gemini']) {
+    const { response, result } = await render(clips, scriptSource);
+    assert.equal(response.ok, true, JSON.stringify(result));
+    assert.equal(result.subtitleTiming, 'scene-matched');
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'json', 'public' + result.videoUrl,
+    ]);
+    assert.deepEqual(JSON.parse(stdout).streams.map((stream: { codec_type: string }) => stream.codec_type), ['video']);
+    const cues = parseSrt(await fs.readFile('public' + result.srtUrl, 'utf8'), result.durationSec + 0.05);
+    assert.equal(cues.length, clips.length);
+    let expected = 0;
+    for (let i = 0; i < cues.length; i++) {
+      assert.ok(Math.abs(cues[i].sourceStart - expected) < 0.041, `Cue ${i + 1} starts at the wrong scene`);
+      expected += durations[i];
+      assert.ok(Math.abs(cues[i].sourceEnd - expected) < 0.041, `Cue ${i + 1} ends at the wrong scene`);
+      assert.equal(cues[i].burmeseScript.replace(/\s+/g, ' ').trim(), clips[i].burmeseScript);
+    }
+    assert.ok(Math.abs(result.durationSec - expected) < 0.041);
+  }
+
+  for (const invalid of [
+    [{ ...clips[0], sourceEnd: clips[0].sourceStart }],
+    [clips[0], { ...clips[1], sourceStart: 1 }],
+    [{ ...clips[0], burmeseScript: ' ' }],
+    [{ ...clips[0], sourceEnd: 100 }],
+  ]) {
+    const { response } = await render(invalid);
+    assert.equal(response.status, 400);
+  }
+  console.log('Silent recap, scene-timed SRT, and invalid range checks passed.');
+} finally {
+  await Promise.all(files.map((file) => fs.rm(file, { force: true })));
 }
-// Repeating the fixture as chronological adjacent segments reveals cumulative AAC padding drift.
-await fs.copyFile(`${directory}/source.mp4`, 'public/uploads/timing-review-long.mp4');
-const { execFileSync } = await import('node:child_process');
-execFileSync('ffmpeg', ['-v', 'error', '-y', '-stream_loop', '3', '-i', `${directory}/source.mp4`, '-c', 'copy', 'public/uploads/timing-review-long.mp4']);
-const multi = await render({ ...payload, sourceVideoUrl: '/uploads/timing-review-long.mp4', clips: [0, 1, 2, 3].map(i => ({ ...clip, id: i + 1, sourceStart: i * 6.2, sourceEnd: (i + 1) * 6.2 })) });
-assert.equal(multi.ok, true, JSON.stringify(multi.data));
-assert.ok(Math.abs(multi.data.durationSec - expected * 4) < 0.05, `multi-segment drift: ${multi.data.durationSec} vs ${expected * 4}`);
-const filters = execFileSync('ffmpeg', ['-hide_banner', '-filters'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-const burned = await render({ ...payload, includeSubtitles: true });
-if (/\bass\s+V->V/.test(filters)) assert.equal(burned.ok, true, JSON.stringify(burned.data));
-else {
-  assert.equal(burned.ok, false);
-  assert.match(burned.data.error, /libass/);
-}
-console.log('Render checks passed: missing/stale audio, long narration rejection, SRT/Gemini consistency, aligned cues, four-segment drift.');

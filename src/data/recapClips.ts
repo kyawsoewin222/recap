@@ -8,15 +8,6 @@ export interface RecapClip {
   burmeseScript: string;
 }
 
-export interface ClipAudioState {
-  subtitleCues?: Array<{ start: number; end: number; burmese: string }>;
-  subtitleTiming?: 'aligned' | 'approximate';
-  audioUrl?: string;
-  durationSec?: number;
-  status: 'idle' | 'generating' | 'ready' | 'error';
-  error?: string;
-}
-
 export interface RenderResult {
   videoUrl: string;
   srtUrl: string;

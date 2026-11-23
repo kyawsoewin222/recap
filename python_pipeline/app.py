@@ -2,9 +2,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 from checkpoint_store import load_checkpoint
-from edge_tts_service import generate_edge_tts
 from gemini_script_service import generate_resumable_recap_plan
-from models import EdgeTTSRequest, GeneratePlanRequest, RenderRequest
+from models import GeneratePlanRequest, RenderRequest
 from video_renderer import render_16x9_recap
 
 app = FastAPI(title="Burmese 16:9 Recap Studio (Resumable Pipeline)")
@@ -35,24 +34,6 @@ def get_job_checkpoint(job_id: str):
     return state
 
 
-@app.post("/api/tts")
-async def create_edge_tts(req: EdgeTTSRequest):
-    try:
-        out_mp3, duration = await generate_edge_tts(
-            clip_id=req.clip_id,
-            text=req.text,
-            voice_name=req.voice_name,
-            rate=req.rate,
-        )
-        return {
-            "audio_url": f"/storage/tts/{out_mp3.name}",
-            "audio_path": str(out_mp3),
-            "duration_sec": duration,
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
 @app.post("/api/render")
 def render_video(req: RenderRequest):
     try:
@@ -63,9 +44,6 @@ def render_video(req: RenderRequest):
             include_subtitles=req.include_subtitles,
             mask_bottom_subtitles=req.mask_bottom_subtitles,
             original_audio_volume=req.original_audio_volume,
-            voiceover_volume=req.voiceover_volume,
-            auto_duck_original_audio=req.auto_duck_original_audio,
-            video_only=req.video_only,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
