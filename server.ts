@@ -157,15 +157,6 @@ function formatAssTime(seconds: number): string {
   return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
 }
 
-function formatSrtTime(seconds: number): string {
-  const clamped = Math.round(Math.max(0, seconds) * 1000);
-  const h = Math.floor(clamped / 3600000);
-  const m = Math.floor((clamped % 3600000) / 60000);
-  const s = Math.floor((clamped % 60000) / 1000);
-  const ms = clamped % 1000;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
-}
-
 function escapeAssText(text: string): string {
   return text
     .replace(/\\/g, '\\\\')
