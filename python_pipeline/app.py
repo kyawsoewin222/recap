@@ -21,6 +21,7 @@ def create_or_resume_plan(req: GeneratePlanRequest):
             low_res_upload=req.low_res_upload,
             strip_audio_in_proxy=req.strip_audio_in_proxy,
             free_tier_delay_sec=req.free_tier_delay_sec,
+            provider=req.provider,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

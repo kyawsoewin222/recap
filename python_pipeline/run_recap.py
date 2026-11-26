@@ -18,6 +18,7 @@ async def run_pipeline(args: argparse.Namespace) -> None:
         low_res_upload=not args.full_res_upload,
         strip_audio_in_proxy=args.strip_audio,
         free_tier_delay_sec=args.delay,
+        provider=args.provider,
     )
 
     job_id = plan["job_id"]
@@ -76,6 +77,12 @@ def main() -> None:
     parser.add_argument("--orig-vol", type=float, default=1.0, help="Original video audio volume (0.0 - 1.5)")
     parser.add_argument("--no-subtitles", action="store_true", help="Do not burn in Burmese subtitles")
     parser.add_argument("--no-mask", action="store_true", help="Do not draw bottom dark scrim")
+    parser.add_argument(
+        "--provider",
+        default="auto",
+        choices=["auto", "agy", "gemini"],
+        help="AI provider ('auto' uses Gemini API if GEMINI_API_KEY is set, else local agy CLI)",
+    )
     args = parser.parse_args()
 
     asyncio.run(run_pipeline(args))

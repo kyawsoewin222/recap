@@ -1,14 +1,17 @@
 # 16:9 Burmese Movie Recap Pipeline — Step-by-Step Implementation Spec (For Codex)
 
-Implement a resumable Python pipeline that converts any short clip or **2-hour movie** into a fast-paced **16:9 (1280×720)** Burmese movie recap video using **Gemini (`gemini-4-hydrogen`)** for video analysis/scripting, **FFmpeg + `libass`** for rendering with original movie audio preserved.
+Implement a resumable Python pipeline that converts any short clip or **2-hour movie** into a fast-paced **16:9 (1280×720)** Burmese movie recap video using **dual-provider AI** — either the **Gemini API (`gemini-4-hydrogen`)** or the local **Antigravity CLI (`agy`, defaulting to `gemini-4-argon-medium` for video analysis)** — for video analysis/scripting, and **FFmpeg + `libass`** for rendering with original movie audio preserved.
 
 ---
 
 ## Target Tech Stack & System Requirements
 
 - **Python Packages**: `google-genai`, `pydantic`, `fastapi`, `uvicorn`
-- **System Tools**: `ffmpeg`, `ffprobe` (compiled with `libx264`, `aac`, and `libass`), plus `Noto Sans Myanmar` font (`fonts-noto-core` / `fonts-noto-extra`)
-- **Environment Variable**: `GEMINI_API_KEY` (used only for Gemini video-to-script analysis)
+- **System Tools**: `ffmpeg`, `ffprobe` (compiled with `libx264`, `aac`, and `libass`), `Noto Sans Myanmar` font (`fonts-noto-core` / `fonts-noto-extra`), and `agy` CLI (`AGY_BIN`, default `agy`) when using `AI_PROVIDER="agy"` or `auto` fallback
+- **Environment Variables** (see `.env.example`):
+  - `AI_PROVIDER`: `"auto"` (default — uses Gemini API if `GEMINI_API_KEY` is configured, otherwise falls back to `agy` CLI), `"agy"`, or `"gemini"`.
+  - `GEMINI_API_KEY`: Required when `AI_PROVIDER="gemini"`; optional when using `agy` CLI or `auto` fallback.
+  - `AGY_BIN` (default `"agy"`), `AGY_VIDEO_MODEL` (default `"gemini-4-argon-medium"`), `GEMINI_VIDEO_MODEL` (default `"gemini-4-hydrogen"`). (Node.js text endpoints also use `AGY_TEXT_MODEL="gemini-4-hydrogen-medium"` and `GEMINI_TEXT_MODEL="gemini-4-hydrogen"`.)
 
 ---
 
@@ -31,7 +34,8 @@ To ensure long 2-hour movie jobs never restart from zero on rate limits or trans
 2. **Checkpoint Schema (`checkpoint.json`)**:
    - `job_id`, `source_video_path`, `total_duration_sec`, `chunk_seconds`
    - `proxy_video_path` (cached 360p upload proxy)
-   - `gemini_file_name`, `gemini_file_uri`, `gemini_file_mime`
+   - `gemini_file_name`, `gemini_file_uri`, `gemini_file_mime` (when using `gemini` provider)
+   - `agy_conversation_id` (persisted for `-r <conversation_id>` chunk continuity when using `agy` provider)
    - `story_so_far` (rolling 2–3 sentence plot summary passed between chunks)
    - `chunks` (dict keyed by chunk index `"0"`, `"1"`, ... holding completed clip arrays)
    - `completed: bool`
@@ -50,19 +54,21 @@ To ensure long 2-hour movie jobs never restart from zero on rate limits or trans
 
 ---
 
-## Step 4: Chunked Video Analysis (`gemini-4-hydrogen`)
-Split `total_duration_sec` into **20-minute windows** (`chunk_minutes=20`, e.g., 6 chunks for a 2-hour movie):
+## Step 4: Chunked Video Analysis (`GEMINI_VIDEO_MODEL` / `AGY_VIDEO_MODEL`)
+Provider resolution (`resolve_ai_provider(provider)`) selects `"gemini"` or `"agy"` based on the per-request/CLI `provider` override (`GeneratePlanRequest.provider` on `/api/plan` or `--provider auto|agy|gemini` on `run_recap.py`), `AI_PROVIDER`, and whether `GEMINI_API_KEY` is set:
+- **Gemini API path (`gemini`):** Split `total_duration_sec` into **20-minute windows** (`chunk_minutes=20`, e.g., 6 chunks for a 2-hour movie) and call `client.models.generate_content(model=GEMINI_VIDEO_MODEL, ...)` (default `"gemini-4-hydrogen"`) with:
+  - `types.Part.from_uri(file_uri=..., mime_type=..., video_metadata=types.VideoMetadata(start_offset=f"{start}s", end_offset=f"{end}s", fps=0.5))`
+  - `config=types.GenerateContentConfig(media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW, response_mime_type="application/json", response_schema=ChunkPlanResult)`
+- **Antigravity CLI path (`agy`):** Slice **10-minute** low-bitrate 360p 1fps proxy chunks (`build_lowres_chunk()`), invoke `agy -p --model <AGY_VIDEO_MODEL>` (default `"gemini-4-argon-medium"`) with `--add-dir <chunk_dir>`, `--json-schema`, and `-r <agy_conversation_id>` so `agy` inspects each chunk via `read_file` and maintains continuity across chunks.
+
 1. Loop through `(start, end)` ranges. If `str(idx)` already exists in `checkpoint["chunks"]`, skip it immediately.
-2. Call `client.models.generate_content(model="gemini-4-hydrogen", ...)` with:
-   - `types.Part.from_uri(file_uri=..., mime_type=..., video_metadata=types.VideoMetadata(start_offset=f"{start}s", end_offset=f"{end}s", fps=0.5))`
-   - `config=types.GenerateContentConfig(media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW, response_mime_type="application/json", response_schema=ChunkPlanResult)`
-3. Prompt requirements:
+2. Prompt requirements:
    - Summarize only `[start, end]` using absolute movie timestamps (`source_start`, `source_end`).
    - Keep each segment **short and punchy (3–5 seconds spoken, 1 single short sentence, ~10–14 words max)** so Burmese subtitles stay clean at 1–2 lines instead of long multi-sentence blocks.
    - Do **not** copy or translate dialogue verbatim—use completely original recap wording in both `english_script` and natural spoken `burmese_script`.
    - Return a 2–3 sentence `chunk_summary` to update `story_so_far` for continuity into the next chunk.
-4. Immediately save each completed chunk to `checkpoint.json`. Add an optional configurable delay (e.g., `25s`–`60s`) between chunks when running on Gemini Free Tier (250k TPM cap).
-5. Flatten all chunks and sequentially re-number `clip.id` (`1..N`), then export `script.json` and `script_burmese.txt`.
+3. Immediately save each completed chunk to `checkpoint.json`. Add an optional configurable delay (e.g., `25s`–`60s`) between chunks when running on Gemini Free Tier (250k TPM cap).
+4. Flatten all chunks and sequentially re-number `clip.id` (`1..N`), then export `script.json` and `script_burmese.txt`.
 
 ---
 

@@ -19,6 +19,7 @@ class GeneratePlanRequest(BaseModel):
     low_res_upload: bool = True
     strip_audio_in_proxy: bool = False
     free_tier_delay_sec: float = 25.0
+    provider: Optional[str] = None  # "auto" | "agy" | "gemini"
 
 
 class RenderRequest(BaseModel):
