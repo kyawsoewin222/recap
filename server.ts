@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type } from '@google/genai';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import express from 'express';
@@ -32,9 +32,31 @@ fs.mkdirSync(RENDERS_DIR, { recursive: true });
 fs.mkdirSync(AISTUDIO_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
+export type AiProvider = 'gemini' | 'agy';
+
+const AGY_BIN = process.env.AGY_BIN || 'agy';
+const AGY_TEXT_MODEL =
+  process.env.AGY_TEXT_MODEL || process.env.AGY_MODEL || 'gemini-4-hydrogen-medium';
+const AGY_VIDEO_MODEL =
+  process.env.AGY_VIDEO_MODEL || process.env.AGY_MODEL || 'gemini-4-argon-medium';
+const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || 'gemini-4-hydrogen';
+const GEMINI_VIDEO_MODEL = process.env.GEMINI_VIDEO_MODEL || 'gemini-4-hydrogen';
+
+function hasConfiguredGeminiKey(): boolean {
+  const key = (process.env.GEMINI_API_KEY || '').trim();
+  return Boolean(key && key !== 'MY_GEMINI_API_KEY');
+}
+
+function resolveAiProvider(override?: string): AiProvider {
+  const mode = (override || process.env.AI_PROVIDER || 'auto').trim().toLowerCase();
+  if (mode === 'gemini') return 'gemini';
+  if (mode === 'agy') return 'agy';
+  return hasConfiguredGeminiKey() ? 'gemini' : 'agy';
+}
+
 function getAiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (!hasConfiguredGeminiKey()) {
     throw new Error(
       'GEMINI_API_KEY is not configured. Add it in the Settings > Secrets panel.'
     );
@@ -47,6 +69,122 @@ function getAiClient(): GoogleGenAI {
       },
     },
   });
+}
+
+interface AgyPromptOptions {
+  model: string;
+  prompt: string;
+  jsonSchema?: unknown;
+  conversationId?: string;
+  addDirs?: string[];
+}
+
+interface AgyPromptResult {
+  text: string;
+  structuredOutput: unknown;
+  conversationId?: string;
+}
+
+async function runAgyPrompt(options: AgyPromptOptions): Promise<AgyPromptResult> {
+  const args = [
+    '-p',
+    options.prompt,
+    '--model',
+    options.model,
+    '--disable-slash-commands',
+    '--dangerously-skip-permissions',
+    '--output-format',
+    'json',
+  ];
+
+  if (options.jsonSchema !== undefined) {
+    args.push(
+      '--json-schema',
+      typeof options.jsonSchema === 'string'
+        ? options.jsonSchema
+        : JSON.stringify(options.jsonSchema)
+    );
+  }
+  if (options.conversationId) {
+    args.push('-r', options.conversationId);
+  }
+  for (const dir of options.addDirs || []) {
+    if (dir) {
+      args.push('--add-dir', dir);
+    }
+  }
+
+  const { stdout, stderr, exitCode } = await new Promise<{
+    stdout: string;
+    stderr: string;
+    exitCode: number | null;
+  }>((resolve, reject) => {
+    const child = spawn(AGY_BIN, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    });
+
+    let stdoutBuf = '';
+    let stderrBuf = '';
+    child.stdout.on('data', (chunk: Buffer | string) => {
+      stdoutBuf += chunk.toString();
+    });
+    child.stderr.on('data', (chunk: Buffer | string) => {
+      stderrBuf += chunk.toString();
+    });
+    child.on('error', (err) => {
+      reject(new Error(`Failed to launch ${AGY_BIN}: ${err.message}`));
+    });
+    child.on('close', (code) => {
+      resolve({ stdout: stdoutBuf, stderr: stderrBuf, exitCode: code });
+    });
+  });
+
+  if (exitCode !== 0) {
+    const detail = (stderr || stdout).trim().slice(0, 600);
+    throw new Error(
+      `agy CLI exited with code ${exitCode}${detail ? `: ${detail}` : ''}`
+    );
+  }
+
+  const trimmed = stdout.trim();
+  if (!trimmed) {
+    throw new Error('agy CLI returned empty output.');
+  }
+
+  let envelope: {
+    status?: string;
+    response?: unknown;
+    structured_output?: unknown;
+    conversation_id?: unknown;
+    error?: unknown;
+    message?: unknown;
+  };
+  try {
+    envelope = JSON.parse(trimmed);
+  } catch {
+    const lastLine = trimmed.split(/\r?\n/).filter(Boolean).pop() || '';
+    try {
+      envelope = JSON.parse(lastLine);
+    } catch {
+      throw new Error(`Invalid JSON output from agy CLI: ${trimmed.slice(0, 400)}`);
+    }
+  }
+
+  if (envelope.status !== 'SUCCESS') {
+    const errDetail =
+      (typeof envelope.error === 'string' && envelope.error) ||
+      (typeof envelope.message === 'string' && envelope.message) ||
+      `status=${String(envelope.status || 'UNKNOWN')}`;
+    throw new Error(`agy CLI failed: ${errDetail}`);
+  }
+
+  return {
+    text: typeof envelope.response === 'string' ? envelope.response : '',
+    structuredOutput: envelope.structured_output,
+    conversationId:
+      typeof envelope.conversation_id === 'string' ? envelope.conversation_id : undefined,
+  };
 }
 
 async function probeDuration(filePath: string): Promise<number> {
@@ -278,6 +416,7 @@ async function startServer() {
     res.json({
       ok: true,
       sourceExists: fs.existsSync(SOURCE_VIDEO_PATH),
+      aiProvider: resolveAiProvider(),
     });
   });
 
@@ -346,31 +485,47 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
 
   app.post('/api/translate', async (req, res) => {
     try {
-      const { englishScript, videoDuration } = req.body as {
+      const { englishScript, videoDuration, provider: providerOverride } = req.body as {
         englishScript: string;
         videoDuration?: number;
+        provider?: string;
       };
       if (!englishScript || !englishScript.trim()) {
         res.status(400).json({ error: 'English script text is required.' });
         return;
       }
 
+      const provider = resolveAiProvider(providerOverride);
       const durHint =
         typeof videoDuration === 'number' && Number.isFinite(videoDuration) && videoDuration > 0
           ? `Fit comfortably within ${videoDuration.toFixed(1)} seconds at natural 1.0x speaking speed (target ~${Math.max(18, Math.floor((videoDuration - 0.55) * 7.8))} Burmese characters/graphemes, 1–2 short easy-to-read subtitle lines).`
           : 'Keep it concise (1–2 short, easy-to-read subtitle lines).';
 
-      const ai = getAiClient();
-      const response = await withGeminiRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: `Rewrite this movie recap beat into natural, conversational spoken Burmese storytelling (like telling a story to a friend, NOT stiff book-style writing). Preserve character names, actions, cause, and outcome without adding facts. ${durHint} Return ONLY the Burmese narration text with no quotes or notes:\n\n${englishScript.trim()}`,
-        })
-      );
+      const prompt = `Rewrite this movie recap beat into natural, conversational spoken Burmese storytelling (like telling a story to a friend, NOT stiff book-style writing). Preserve character names, actions, cause, and outcome without adding facts. ${durHint} Return ONLY the Burmese narration text with no quotes or notes:\n\n${englishScript.trim()}`;
 
-      const burmeseScript = response.text?.trim();
+      let rawText: string | undefined;
+      if (provider === 'gemini') {
+        const ai = getAiClient();
+        const response = await withGeminiRetry(() =>
+          ai.models.generateContent({
+            model: GEMINI_TEXT_MODEL,
+            contents: prompt,
+          })
+        );
+        rawText = response.text;
+      } else {
+        const agyResult = await runAgyPrompt({
+          model: AGY_TEXT_MODEL,
+          prompt,
+        });
+        rawText = agyResult.text;
+      }
+
+      const burmeseScript = rawText?.trim();
       if (!burmeseScript) {
-        res.status(502).json({ error: 'Empty translation returned from Gemini.' });
+        res.status(502).json({
+          error: `Empty translation returned from ${provider === 'agy' ? 'agy CLI' : 'Gemini'}.`,
+        });
         return;
       }
 
@@ -388,24 +543,23 @@ with ZipFile(archive, 'w', compression=ZIP_STORED) as zip_file:
 
   app.post('/api/shorten-clip', async (req, res) => {
     try {
-      const { burmeseScript, englishScript, sourceStart, sourceEnd } = req.body as {
-        burmeseScript: string;
-        englishScript?: string;
-        sourceStart: number;
-        sourceEnd: number;
-      };
+      const { burmeseScript, englishScript, sourceStart, sourceEnd, provider: providerOverride } =
+        req.body as {
+          burmeseScript: string;
+          englishScript?: string;
+          sourceStart: number;
+          sourceEnd: number;
+          provider?: string;
+        };
       if (!burmeseScript || !burmeseScript.trim()) {
         res.status(400).json({ error: 'Burmese script text is required.' });
         return;
       }
+      const provider = resolveAiProvider(providerOverride);
       const videoDuration = Math.max(1.5, Number(sourceEnd) - Number(sourceStart) || 5);
       const targetGraphemes = Math.max(18, Math.floor((videoDuration - 0.55) * 7.8));
 
-      const ai = getAiClient();
-      const response = await withGeminiRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: `Condense this Burmese movie recap line so a narrator speaking at normal 1.0x speed finishes comfortably inside ${videoDuration.toFixed(1)} seconds (around ${targetGraphemes} Burmese characters/graphemes or fewer, 1–2 short readable subtitle lines).
+      const prompt = `Condense this Burmese movie recap line so a narrator speaking at normal 1.0x speed finishes comfortably inside ${videoDuration.toFixed(1)} seconds (around ${targetGraphemes} Burmese characters/graphemes or fewer, 1–2 short readable subtitle lines).
 
 Rules:
 - Remove repetition and wordy filler ONLY.
@@ -414,13 +568,31 @@ Rules:
 - Return ONLY the shortened Burmese text with no quotes or explanations.
 
 English plot reference: ${(englishScript || '').trim() || '(none)'}
-Original Burmese text: ${burmeseScript.trim()}`,
-        })
-      );
+Original Burmese text: ${burmeseScript.trim()}`;
 
-      const shortened = response.text?.trim();
+      let rawText: string | undefined;
+      if (provider === 'gemini') {
+        const ai = getAiClient();
+        const response = await withGeminiRetry(() =>
+          ai.models.generateContent({
+            model: GEMINI_TEXT_MODEL,
+            contents: prompt,
+          })
+        );
+        rawText = response.text;
+      } else {
+        const agyResult = await runAgyPrompt({
+          model: AGY_TEXT_MODEL,
+          prompt,
+        });
+        rawText = agyResult.text;
+      }
+
+      const shortened = rawText?.trim();
       if (!shortened) {
-        res.status(502).json({ error: 'Empty shortened narration returned from Gemini.' });
+        res.status(502).json({
+          error: `Empty shortened narration returned from ${provider === 'agy' ? 'agy CLI' : 'Gemini'}.`,
+        });
         return;
       }
 
@@ -443,27 +615,193 @@ Original Burmese text: ${burmeseScript.trim()}`,
     );
 
     try {
-      const { sourceVideoUrl } = req.body as { sourceVideoUrl?: string };
+      const { sourceVideoUrl, provider: providerOverride } = req.body as {
+        sourceVideoUrl?: string;
+        provider?: string;
+      };
       const sourcePath = resolveSourceVideoPath(sourceVideoUrl);
       if (!fs.existsSync(sourcePath)) {
         res.status(404).json({ error: 'Uploaded episode file was not found on server.' });
         return;
       }
 
+      const provider = resolveAiProvider(providerOverride);
       const info = await probeVideoInfo(sourcePath);
       const totalDur = Math.max(1, info.durationSec);
-      const ai = getAiClient();
 
-      const CHUNK_SEC = 1200; // 20-minute chunk boundary
-      const chunkFiles: Array<{ filePath: string; offsetSec: number; durationSec: number }> = [];
+      type RawAnalyzedClip = {
+        title: string;
+        sourceStart: number;
+        sourceEnd: number;
+        targetDuration: number;
+        englishScript: string;
+        burmeseScript: string;
+      };
 
-      if (totalDur <= CHUNK_SEC) {
-        chunkFiles.push({ filePath: sourcePath, offsetSec: 0, durationSec: totalDur });
+      const allClips: Array<RawAnalyzedClip & { id: number }> = [];
+      let nextId = 1;
+
+      const appendValidatedClips = (
+        items: RawAnalyzedClip[],
+        chunkOffsetSec: number,
+        chunkDurationSec: number,
+        providerLabel: string
+      ) => {
+        let prevRelEnd = 0;
+        for (const item of items) {
+          const relStart = Number(item.sourceStart);
+          const relEnd = Number(item.sourceEnd);
+          const burmeseScript = String(item.burmeseScript || '').trim();
+          if (
+            !Number.isFinite(relStart) ||
+            !Number.isFinite(relEnd) ||
+            relStart < prevRelEnd ||
+            relStart < 0 ||
+            relEnd <= relStart ||
+            relEnd > chunkDurationSec ||
+            !burmeseScript
+          ) {
+            throw new Error(
+              `${providerLabel} returned an invalid scene or empty Burmese text. Please analyze the episode again.`
+            );
+          }
+          prevRelEnd = relEnd;
+          const spanDur = relEnd - relStart;
+          allClips.push({
+            id: nextId,
+            title: `${String(nextId).padStart(2, '0')}. ${(item.title || `Scene ${nextId}`).replace(/^\d+\.\s*/, '')}`,
+            sourceStart: Number((chunkOffsetSec + relStart).toFixed(2)),
+            sourceEnd: Number((chunkOffsetSec + relEnd).toFixed(2)),
+            targetDuration: Number(spanDur.toFixed(2)),
+            englishScript: String(item.englishScript || '').trim(),
+            burmeseScript,
+          });
+          nextId++;
+        }
+      };
+
+      const buildStoryboardPrompt = (chunkDurationSec: number) =>
+        `Analyze this ${chunkDurationSec.toFixed(1)}-second video clip and create a chronological YouTube movie recap storyboard with natural spoken Burmese storytelling.
+
+Rules:
+1. Tell the story in original, natural spoken Burmese, not a word-for-word dialogue transcript. Do not invent facts.
+2. Preserve the essential plot chronologically: character identities, actions, motivations, cause and effect, important dialogue meaning, reveals, and outcomes. Skip repetition and dead time first; never cut an essential story beat to meet a duration.
+3. Aim for selected scenes totaling around 40–60% of this episode (roughly 2–3 minutes for a 5-minute episode). Allow longer when necessary for story clarity.
+4. Choose complete, relevant visuals and write concise Burmese storytelling for each scene. Allow enough scene time for the text and important action; do not cut off meaningful action to meet a fixed cue length.
+5. Provide accurate, strictly chronological, non-overlapping source timestamps relative to THIS video clip (0 to ${chunkDurationSec.toFixed(1)}), with sourceEnd > sourceStart and targetDuration = sourceEnd - sourceStart.
+6. Return burmeseScript (Myanmar Unicode), a concise englishScript summary, and a short title.`;
+
+      if (provider === 'gemini') {
+        const ai = getAiClient();
+        const CHUNK_SEC = 1200; // 20-minute chunk boundary
+        const chunkFiles: Array<{ filePath: string; offsetSec: number; durationSec: number }> = [];
+
+        if (totalDur <= CHUNK_SEC) {
+          chunkFiles.push({ filePath: sourcePath, offsetSec: 0, durationSec: totalDur });
+        } else {
+          fs.mkdirSync(tempChunkDir, { recursive: true });
+          for (let start = 0, idx = 0; start < totalDur; start += CHUNK_SEC, idx++) {
+            const dur = Math.min(CHUNK_SEC, totalDur - start);
+            const chunkPath = path.join(tempChunkDir, `chunk-${idx}.mp4`);
+            await execFileAsync('ffmpeg', [
+              '-y',
+              '-ss',
+              start.toFixed(2),
+              '-t',
+              dur.toFixed(2),
+              '-i',
+              sourcePath,
+              '-c',
+              'copy',
+              chunkPath,
+            ]);
+            chunkFiles.push({ filePath: chunkPath, offsetSec: start, durationSec: dur });
+          }
+        }
+
+        for (const chunk of chunkFiles) {
+          const uploaded = await withGeminiRetry(() =>
+            ai.files.upload({
+              file: chunk.filePath,
+              config: { mimeType: 'video/mp4' },
+            })
+          );
+
+          let fileState = uploaded;
+          while (fileState.state === 'PROCESSING') {
+            await new Promise((r) => setTimeout(r, 2500));
+            if (!fileState.name) break;
+            fileState = await ai.files.get({ name: fileState.name });
+          }
+
+          if (fileState.state === 'FAILED' || !fileState.uri) {
+            throw new Error('Gemini video processing failed for uploaded episode.');
+          }
+
+          try {
+            const prompt = buildStoryboardPrompt(chunk.durationSec);
+            const response = await withGeminiRetry(() =>
+              ai.models.generateContent({
+                model: GEMINI_VIDEO_MODEL,
+                contents: [
+                  {
+                    role: 'user',
+                    parts: [
+                      {
+                        fileData: {
+                          fileUri: fileState.uri!,
+                          mimeType: fileState.mimeType || 'video/mp4',
+                        },
+                      },
+                      { text: prompt },
+                    ],
+                  },
+                ],
+                config: {
+                  responseMimeType: 'application/json',
+                  responseSchema: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        title: { type: Type.STRING },
+                        sourceStart: { type: Type.NUMBER },
+                        sourceEnd: { type: Type.NUMBER },
+                        targetDuration: { type: Type.NUMBER },
+                        englishScript: { type: Type.STRING },
+                        burmeseScript: { type: Type.STRING },
+                      },
+                      required: [
+                        'title',
+                        'sourceStart',
+                        'sourceEnd',
+                        'targetDuration',
+                        'englishScript',
+                        'burmeseScript',
+                      ],
+                    },
+                  },
+                },
+              })
+            );
+
+            const rawText = (response.text ?? '[]').trim();
+            const parsed = JSON.parse(rawText) as RawAnalyzedClip[];
+            appendValidatedClips(parsed, chunk.offsetSec, chunk.durationSec, 'Gemini');
+          } finally {
+            if (fileState.name) {
+              await ai.files.delete({ name: fileState.name }).catch(() => {});
+            }
+          }
+        }
       } else {
+        const CHUNK_SEC = 600; // 10-minute proxy chunk boundary for agy CLI
+        const chunkFiles: Array<{ filePath: string; offsetSec: number; durationSec: number }> = [];
+
         fs.mkdirSync(tempChunkDir, { recursive: true });
         for (let start = 0, idx = 0; start < totalDur; start += CHUNK_SEC, idx++) {
           const dur = Math.min(CHUNK_SEC, totalDur - start);
-          const chunkPath = path.join(tempChunkDir, `chunk-${idx}.mp4`);
+          const chunkPath = path.join(tempChunkDir, `proxy-chunk-${idx}.mp4`);
           await execFileAsync('ffmpeg', [
             '-y',
             '-ss',
@@ -472,141 +810,93 @@ Original Burmese text: ${burmeseScript.trim()}`,
             dur.toFixed(2),
             '-i',
             sourcePath,
-            '-c',
-            'copy',
+            '-vf',
+            'scale=640:-2',
+            '-r',
+            '1',
+            '-c:v',
+            'libx264',
+            '-preset',
+            'veryfast',
+            '-crf',
+            '32',
+            '-c:a',
+            'aac',
+            '-b:a',
+            '48k',
             chunkPath,
           ]);
           chunkFiles.push({ filePath: chunkPath, offsetSec: start, durationSec: dur });
         }
-      }
 
-      const allClips: Array<{
-        id: number;
-        title: string;
-        sourceStart: number;
-        sourceEnd: number;
-        targetDuration: number;
-        englishScript: string;
-        burmeseScript: string;
-      }> = [];
-
-      let nextId = 1;
-
-      for (const chunk of chunkFiles) {
-        const uploaded = await withGeminiRetry(() =>
-          ai.files.upload({
-            file: chunk.filePath,
-            config: { mimeType: 'video/mp4' },
-          })
-        );
-
-        let fileState = uploaded;
-        while (fileState.state === 'PROCESSING') {
-          await new Promise((r) => setTimeout(r, 2500));
-          if (!fileState.name) break;
-          fileState = await ai.files.get({ name: fileState.name });
-        }
-
-        if (fileState.state === 'FAILED' || !fileState.uri) {
-          throw new Error('Gemini video processing failed for uploaded episode.');
-        }
-
-        try {
-          const prompt = `Analyze this ${chunk.durationSec.toFixed(1)}-second video clip and create a chronological YouTube movie recap storyboard with natural spoken Burmese storytelling.
-
-Rules:
-1. Tell the story in original, natural spoken Burmese, not a word-for-word dialogue transcript. Do not invent facts.
-2. Preserve the essential plot chronologically: character identities, actions, motivations, cause and effect, important dialogue meaning, reveals, and outcomes. Skip repetition and dead time first; never cut an essential story beat to meet a duration.
-3. Aim for selected scenes totaling around 40–60% of this episode (roughly 2–3 minutes for a 5-minute episode). Allow longer when necessary for story clarity.
-4. Choose complete, relevant visuals and write concise Burmese storytelling for each scene. Allow enough scene time for the text and important action; do not cut off meaningful action to meet a fixed cue length.
-5. Provide accurate, strictly chronological, non-overlapping source timestamps relative to THIS video clip (0 to ${chunk.durationSec.toFixed(1)}), with sourceEnd > sourceStart and targetDuration = sourceEnd - sourceStart.
-6. Return burmeseScript (Myanmar Unicode), a concise englishScript summary, and a short title.`;
-
-          const response = await withGeminiRetry(() =>
-            ai.models.generateContent({
-              model: 'gemini-4-hydrogen',
-              contents: [
-                {
-                  role: 'user',
-                  parts: [
-                    {
-                      fileData: {
-                        fileUri: fileState.uri!,
-                        mimeType: fileState.mimeType || 'video/mp4',
-                      },
-                    },
-                    { text: prompt },
-                  ],
+        const agyAnalyzeSchema = {
+          type: 'object',
+          properties: {
+            clips: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  title: { type: 'string' },
+                  sourceStart: { type: 'number' },
+                  sourceEnd: { type: 'number' },
+                  targetDuration: { type: 'number' },
+                  englishScript: { type: 'string' },
+                  burmeseScript: { type: 'string' },
                 },
-              ],
-              config: {
-                responseMimeType: 'application/json',
-                responseSchema: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      title: { type: Type.STRING },
-                      sourceStart: { type: Type.NUMBER },
-                      sourceEnd: { type: Type.NUMBER },
-                      targetDuration: { type: Type.NUMBER },
-                      englishScript: { type: Type.STRING },
-                      burmeseScript: { type: Type.STRING },
-                    },
-                    required: [
-                      'title',
-                      'sourceStart',
-                      'sourceEnd',
-                      'targetDuration',
-                      'englishScript',
-                      'burmeseScript',
-                    ],
-                  },
-                },
+                required: [
+                  'title',
+                  'sourceStart',
+                  'sourceEnd',
+                  'targetDuration',
+                  'englishScript',
+                  'burmeseScript',
+                ],
               },
-            })
-          );
+            },
+          },
+          required: ['clips'],
+        };
 
-          const rawText = (response.text ?? '[]').trim();
-          const parsed = JSON.parse(rawText) as Array<{
-            title: string;
-            sourceStart: number;
-            sourceEnd: number;
-            targetDuration: number;
-            englishScript: string;
-            burmeseScript: string;
-          }>;
+        let conversationId: string | undefined;
+        for (let idx = 0; idx < chunkFiles.length; idx++) {
+          const chunk = chunkFiles[idx];
+          const continuationHint =
+            idx > 0
+              ? `This is chunk ${idx + 1} of ${chunkFiles.length} (starting at ${chunk.offsetSec.toFixed(1)}s in the full episode). Continue the story seamlessly from the previous chunk without repeating earlier scenes.\n\n`
+              : '';
+          const agyPrompt = `${continuationHint}First, inspect the video file at \`${chunk.filePath}\` using the \`read_file\` tool.\n\n${buildStoryboardPrompt(chunk.durationSec)}\n\nReturn a JSON object matching the schema with a \`clips\` array.`;
 
-          let prevRelEnd = 0;
-          for (const item of parsed) {
-            const relStart = Number(item.sourceStart);
-            const relEnd = Number(item.sourceEnd);
-            const burmeseScript = String(item.burmeseScript || '').trim();
-            if (!Number.isFinite(relStart) || !Number.isFinite(relEnd) || relStart < prevRelEnd || relStart < 0 || relEnd <= relStart || relEnd > chunk.durationSec || !burmeseScript) {
-              throw new Error('Gemini returned an invalid scene or empty Burmese text. Please analyze the episode again.');
-            }
-            prevRelEnd = relEnd;
-            const spanDur = relEnd - relStart;
-            allClips.push({
-              id: nextId,
-              title: `${String(nextId).padStart(2, '0')}. ${(item.title || `Scene ${nextId}`).replace(/^\d+\.\s*/, '')}`,
-              sourceStart: Number((chunk.offsetSec + relStart).toFixed(2)),
-              sourceEnd: Number((chunk.offsetSec + relEnd).toFixed(2)),
-              targetDuration: Number(spanDur.toFixed(2)),
-              englishScript: String(item.englishScript || '').trim(),
-              burmeseScript,
-            });
-            nextId++;
+          const agyResult = await runAgyPrompt({
+            model: AGY_VIDEO_MODEL,
+            prompt: agyPrompt,
+            jsonSchema: agyAnalyzeSchema,
+            addDirs: [tempChunkDir],
+            conversationId,
+          });
+
+          if (agyResult.conversationId) {
+            conversationId = agyResult.conversationId;
           }
-        } finally {
-          if (fileState.name) {
-            await ai.files.delete({ name: fileState.name }).catch(() => {});
+
+          let payload = agyResult.structuredOutput;
+          if (payload === undefined || payload === null) {
+            payload = JSON.parse((agyResult.text || '{}').trim());
           }
+          const parsedClips = Array.isArray(payload)
+            ? (payload as RawAnalyzedClip[])
+            : Array.isArray((payload as { clips?: unknown })?.clips)
+              ? ((payload as { clips: RawAnalyzedClip[] }).clips)
+              : [];
+
+          appendValidatedClips(parsedClips, chunk.offsetSec, chunk.durationSec, 'agy CLI');
         }
       }
 
       if (allClips.length === 0) {
-        res.status(502).json({ error: 'Gemini returned no recap segments for this video.' });
+        res.status(502).json({
+          error: `${provider === 'agy' ? 'agy CLI' : 'Gemini'} returned no recap segments for this video.`,
+        });
         return;
       }
 
